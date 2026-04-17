@@ -19,7 +19,7 @@ Help AI agents understand and extend the system.
 ## Architecture
 
 -   Backend: FastAPI
--   Frontend: Vue3 + Vite
+-   Frontend: Vue3 + Vite + shadcn
 -   Database: PostgreSQL
 
 ## Naming Conventions
