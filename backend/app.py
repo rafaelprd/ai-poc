@@ -8,8 +8,9 @@ import os
 import re
 import threading
 import unicodedata
+from calendar import monthrange
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, NoReturn
@@ -284,6 +285,41 @@ def serialize_rule(session: Session, rule: "CategorizationRule") -> dict[str, An
     }
 
 
+def serialize_account(account: "Account") -> dict[str, Any]:
+    return {
+        "id": account.id,
+        "name": account.name,
+        "created_at": isoformat_z(account.created_at),
+        "updated_at": isoformat_z(account.updated_at),
+    }
+
+
+def extract_original_description(transaction: "Transaction") -> str:
+    raw_data = transaction.raw_data
+    if isinstance(raw_data, dict):
+        for key in (
+            "original_description",
+            "description_original",
+            "raw_description",
+            "description",
+        ):
+            value = raw_data.get(key)
+            if isinstance(value, str) and normalize_spaces(value):
+                return normalize_spaces(value)[:500]
+    return transaction.description
+
+
+def resolve_account_name(session: Session, account_id: str | None) -> str | None:
+    if not account_id:
+        return None
+
+    account = session.get(Account, str(account_id))
+    if account is not None:
+        return account.name
+
+    return str(account_id)
+
+
 def serialize_transaction(
     session: Session, transaction: "Transaction"
 ) -> dict[str, Any]:
@@ -297,18 +333,27 @@ def serialize_transaction(
         if transaction.import_file_id
         else None
     )
-    import_id = file_row.batch_id if file_row else None
+    import_id = file_row.batch_id if file_row else transaction.import_file_id
+
+    amount = Decimal(str(transaction.amount or 0))
+    if transaction.type == "debit":
+        amount = -abs(amount)
+    else:
+        amount = abs(amount)
+
     return {
         "id": transaction.id,
         "date": transaction.date.isoformat(),
         "description": transaction.description,
-        "original_description": transaction.description,
-        "amount": float(transaction.amount),
+        "original_description": extract_original_description(transaction),
+        "amount": float(amount),
         "category_id": transaction.category_id,
         "category_name": category.name if category else None,
         "account_id": transaction.account_id,
-        "account_name": None,
+        "account_name": resolve_account_name(session, transaction.account_id),
         "import_id": import_id,
+        "categorization_source": transaction.categorization_source,
+        "categorized_at": isoformat_z(transaction.categorized_at),
         "created_at": isoformat_z(transaction.created_at),
         "updated_at": isoformat_z(transaction.updated_at),
     }
@@ -454,12 +499,79 @@ def validate_transaction_ids(value: Any) -> list[int]:
         if item in seen:
             raise_api_error(
                 400,
-                "EMPTY_TRANSACTION_LIST",
+                "DUPLICATE_IDS",
                 "transaction_ids must contain unique IDs.",
             )
         seen.add(item)
         ids.append(item)
     return ids
+
+
+def get_category_or_422(session: Session, category_id: int) -> "Category":
+    category = session.get(Category, category_id)
+    if category is None:
+        raise_api_error(
+            422, "CATEGORY_NOT_FOUND", f"Category with id {category_id} does not exist."
+        )
+    return category
+
+
+def parse_optional_transaction_category_id(session: Session, value: Any) -> int | None:
+    if value == "":
+        raise_api_error(422, "VALIDATION_ERROR", "category_id must be null or int.")
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise_api_error(422, "VALIDATION_ERROR", "category_id must be null or int.")
+    try:
+        category_id = int(value)
+    except Exception:
+        raise_api_error(422, "VALIDATION_ERROR", "category_id must be null or int.")
+    return get_category_or_422(session, category_id).id
+
+
+def parse_transaction_dates(
+    date_from: str | None, date_to: str | None
+) -> tuple[date | None, date | None]:
+    parsed_from = None
+    parsed_to = None
+
+    if date_from:
+        try:
+            parsed_from = parse_date(date_from)
+        except ValueError:
+            raise_api_error(
+                400, "VALIDATION_ERROR", "Invalid date_from. Expected YYYY-MM-DD."
+            )
+
+    if date_to:
+        try:
+            parsed_to = parse_date(date_to)
+        except ValueError:
+            raise_api_error(
+                400, "VALIDATION_ERROR", "Invalid date_to. Expected YYYY-MM-DD."
+            )
+
+    if parsed_from and parsed_to and parsed_from > parsed_to:
+        raise_api_error(400, "INVALID_DATE_RANGE", "date_from cannot be after date_to.")
+
+    return parsed_from, parsed_to
+
+
+def validate_transaction_sort(sort_by: str, sort_order: str) -> tuple[str, str]:
+    allowed_sort_by = {"date", "amount", "description"}
+    allowed_sort_order = {"asc", "desc"}
+
+    if sort_by not in allowed_sort_by:
+        raise_api_error(
+            400,
+            "INVALID_SORT_FIELD",
+            "sort_by must be one of: date, amount, description.",
+        )
+    if sort_order not in allowed_sort_order:
+        raise_api_error(400, "VALIDATION_ERROR", "sort_order must be asc or desc.")
+
+    return sort_by, sort_order
 
 
 def get_category_or_404(session: Session, category_id: int) -> "Category":
@@ -511,6 +623,37 @@ def ensure_system_category(session: Session) -> None:
         session.commit()
 
 
+def ensure_account(
+    session: Session, account_id: str | None, name: str | None = None
+) -> "Account" | None:
+    if account_id is None:
+        return None
+
+    normalized_id = normalize_spaces(str(account_id))
+    if not normalized_id:
+        return None
+
+    normalized_name = normalize_spaces(name or normalized_id)[:100] or normalized_id
+    account = session.get(Account, normalized_id)
+
+    if account is None:
+        account = Account(
+            id=normalized_id,
+            name=normalized_name,
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        session.add(account)
+        session.flush()
+        return account
+
+    if normalized_name and account.name != normalized_name:
+        account.name = normalized_name
+        account.updated_at = utc_now()
+
+    return account
+
+
 def rule_matches(normalized_description: str, keyword: str, match_type: str) -> bool:
     if match_type == "exact":
         return normalized_description == keyword
@@ -535,16 +678,49 @@ def active_rules(session: Session) -> list["CategorizationRule"]:
     )
 
 
+def record_transaction_category_change(
+    session: Session,
+    transaction: "Transaction",
+    old_category_id: int | None,
+    new_category_id: int | None,
+) -> None:
+    session.add(
+        TransactionAuditLog(
+            transaction_id=transaction.id,
+            old_category_id=old_category_id,
+            new_category_id=new_category_id,
+            changed_at=utc_now(),
+        )
+    )
+
+
 def apply_transaction_category(
     session: Session,
     transaction: "Transaction",
     category_id: int | None,
     source: str,
-) -> None:
+    force_metadata: bool = False,
+) -> bool:
+    old_category_id = transaction.category_id
+    changed = old_category_id != category_id
+
+    if not changed and not force_metadata:
+        return False
+
+    if changed:
+        record_transaction_category_change(
+            session, transaction, old_category_id, category_id
+        )
+
     transaction.category_id = category_id
-    transaction.categorized_at = utc_now()
-    transaction.categorization_source = source
-    transaction.updated_at = utc_now()
+    if source:
+        transaction.categorization_source = source
+    if changed or force_metadata:
+        now = utc_now()
+        transaction.categorized_at = now
+        transaction.updated_at = now
+
+    return changed
 
 
 def learn_rule_from_transaction(
@@ -606,6 +782,7 @@ def categorize_transactions(
     for transaction in rows:
         if scope == "all" and transaction.categorization_source == "manual":
             continue
+
         processed += 1
         normalized_description = normalize_text(transaction.description)
         matched_rule = None
@@ -615,21 +792,440 @@ def categorize_transactions(
                 break
 
         if matched_rule is not None:
-            transaction.category_id = matched_rule.category_id
+            apply_transaction_category(
+                session, transaction, matched_rule.category_id, "auto"
+            )
             categorized += 1
         else:
-            transaction.category_id = None
+            apply_transaction_category(session, transaction, None, "auto")
             uncategorized += 1
-
-        transaction.categorized_at = utc_now()
-        transaction.categorization_source = "auto"
-        transaction.updated_at = utc_now()
 
     session.commit()
     return {
         "processed": processed,
         "categorized": categorized,
         "uncategorized": uncategorized,
+    }
+
+
+FIXED_EXPENSE_FREQUENCIES = {
+    "weekly",
+    "biweekly",
+    "monthly",
+    "bimonthly",
+    "quarterly",
+    "semiannual",
+    "annual",
+}
+FIXED_EXPENSE_MONTH_INTERVALS = {
+    "monthly": 1,
+    "bimonthly": 2,
+    "quarterly": 3,
+    "semiannual": 6,
+    "annual": 12,
+}
+FIXED_EXPENSE_ENTRY_STATUSES = {"pending", "paid", "skipped", "cancelled"}
+
+
+def decimal_to_string(value: Decimal | None) -> str | None:
+    if value is None:
+        return None
+    normalized = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return format(normalized, "f")
+
+
+def serialize_fixed_expense(
+    session: Session, expense: "FixedExpense"
+) -> dict[str, Any]:
+    category = (
+        session.get(Category, expense.category_id) if expense.category_id else None
+    )
+    account = session.get(Account, expense.account_id) if expense.account_id else None
+    return {
+        "id": expense.id,
+        "account_id": expense.account_id,
+        "account_name": account.name if account else expense.account_id,
+        "category_id": expense.category_id,
+        "category_name": category.name if category else None,
+        "name": expense.name,
+        "description": expense.description,
+        "amount": decimal_to_string(expense.amount),
+        "frequency": expense.frequency,
+        "day_of_month": expense.day_of_month,
+        "day_of_week": expense.day_of_week,
+        "start_date": expense.start_date.isoformat(),
+        "end_date": expense.end_date.isoformat() if expense.end_date else None,
+        "is_active": expense.is_active,
+        "created_at": isoformat_z(expense.created_at),
+        "updated_at": isoformat_z(expense.updated_at),
+    }
+
+
+def serialize_fixed_expense_entry(
+    session: Session, entry: "FixedExpenseEntry"
+) -> dict[str, Any]:
+    transaction = (
+        session.get(Transaction, entry.transaction_id) if entry.transaction_id else None
+    )
+    return {
+        "id": entry.id,
+        "fixed_expense_id": entry.fixed_expense_id,
+        "reference_date": entry.reference_date.isoformat(),
+        "due_date": entry.due_date.isoformat(),
+        "amount": decimal_to_string(entry.amount),
+        "transaction_id": entry.transaction_id,
+        "transaction": serialize_transaction(session, transaction)
+        if transaction
+        else None,
+        "status": entry.status,
+        "created_at": isoformat_z(entry.created_at),
+        "updated_at": isoformat_z(entry.updated_at),
+    }
+
+
+def get_fixed_expense_or_404(session: Session, expense_id: str) -> "FixedExpense":
+    expense = session.get(FixedExpense, str(expense_id))
+    if expense is None:
+        raise_api_error(404, "NOT_FOUND", f"Fixed expense {expense_id} not found")
+    return expense
+
+
+def get_fixed_expense_entry_or_404(
+    session: Session, entry_id: str
+) -> "FixedExpenseEntry":
+    entry = session.get(FixedExpenseEntry, str(entry_id))
+    if entry is None:
+        raise_api_error(404, "NOT_FOUND", f"Fixed expense entry {entry_id} not found")
+    return entry
+
+
+def parse_fixed_expense_amount(value: Any, field_name: str = "amount") -> Decimal:
+    if value in (None, ""):
+        raise_api_error(400, "VALIDATION_ERROR", f"{field_name} is required.")
+    if isinstance(value, bool):
+        raise_api_error(400, "VALIDATION_ERROR", f"{field_name} must be a decimal.")
+    try:
+        amount = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except Exception:
+        raise_api_error(400, "VALIDATION_ERROR", f"{field_name} must be a decimal.")
+    if amount <= 0:
+        raise_api_error(
+            400, "VALIDATION_ERROR", f"{field_name} must be greater than 0."
+        )
+    return amount
+
+
+def parse_iso_date_field(
+    value: Any, field_name: str, required: bool = True
+) -> date | None:
+    if value in (None, ""):
+        if required:
+            raise_api_error(400, "VALIDATION_ERROR", f"{field_name} is required.")
+        return None
+    if not isinstance(value, str):
+        raise_api_error(400, "VALIDATION_ERROR", f"{field_name} must use YYYY-MM-DD.")
+    try:
+        return datetime.strptime(normalize_spaces(value), "%Y-%m-%d").date()
+    except ValueError:
+        raise_api_error(400, "VALIDATION_ERROR", f"{field_name} must use YYYY-MM-DD.")
+
+
+def parse_optional_int_field(
+    value: Any, field_name: str, min_value: int, max_value: int
+) -> int | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        raise_api_error(422, "VALIDATION_ERROR", f"{field_name} must be an integer.")
+    try:
+        parsed = int(value)
+    except Exception:
+        raise_api_error(422, "VALIDATION_ERROR", f"{field_name} must be an integer.")
+    if parsed < min_value or parsed > max_value:
+        raise_api_error(
+            422,
+            "VALIDATION_ERROR",
+            f"{field_name} must be between {min_value} and {max_value}.",
+        )
+    return parsed
+
+
+def normalize_fixed_expense_name(value: Any) -> str:
+    if not isinstance(value, str):
+        raise_api_error(400, "VALIDATION_ERROR", "name must be text.")
+    normalized = normalize_spaces(value)
+    if not normalized or len(normalized) > 255:
+        raise_api_error(400, "VALIDATION_ERROR", "name must be 1-255 characters.")
+    return normalized
+
+
+def validate_fixed_expense_payload(
+    session: Session,
+    payload: dict[str, Any],
+    partial: bool = False,
+    existing: "FixedExpense" | None = None,
+) -> dict[str, Any]:
+    allowed = {
+        "account_id",
+        "category_id",
+        "name",
+        "description",
+        "amount",
+        "frequency",
+        "day_of_month",
+        "day_of_week",
+        "start_date",
+        "end_date",
+        "is_active",
+    }
+    unknown = set(payload) - allowed
+    if unknown:
+        raise_api_error(400, "VALIDATION_ERROR", "Unexpected fields in request.")
+
+    if partial and ("account_id" in payload or "start_date" in payload):
+        raise_api_error(
+            400,
+            "VALIDATION_ERROR",
+            "account_id and start_date are immutable after creation.",
+        )
+
+    data: dict[str, Any] = {}
+
+    if not partial or "account_id" in payload:
+        raw_account_id = payload.get("account_id")
+        if raw_account_id in (None, ""):
+            raise_api_error(400, "VALIDATION_ERROR", "account_id is required.")
+        if not isinstance(raw_account_id, str):
+            raise_api_error(400, "VALIDATION_ERROR", "account_id must be text.")
+        normalized_account_id = normalize_spaces(raw_account_id)
+        if not normalized_account_id:
+            raise_api_error(400, "VALIDATION_ERROR", "account_id is required.")
+        data["account_id"] = normalized_account_id
+
+    if not partial or "category_id" in payload:
+        raw_category_id = payload.get("category_id")
+        if raw_category_id in (None, ""):
+            data["category_id"] = None
+        else:
+            if isinstance(raw_category_id, bool):
+                raise_api_error(
+                    422, "VALIDATION_ERROR", "category_id must be null or int."
+                )
+            try:
+                category_id = int(raw_category_id)
+            except Exception:
+                raise_api_error(
+                    422, "VALIDATION_ERROR", "category_id must be null or int."
+                )
+            data["category_id"] = get_category_or_422(session, category_id).id
+
+    if not partial or "name" in payload:
+        data["name"] = normalize_fixed_expense_name(payload.get("name"))
+
+    if not partial or "description" in payload:
+        raw_description = payload.get("description")
+        if raw_description is None:
+            data["description"] = None
+        else:
+            if not isinstance(raw_description, str):
+                raise_api_error(400, "VALIDATION_ERROR", "description must be text.")
+            normalized_description = normalize_spaces(raw_description)
+            data["description"] = normalized_description or None
+
+    if not partial or "amount" in payload:
+        data["amount"] = parse_fixed_expense_amount(payload.get("amount"))
+
+    if not partial or "frequency" in payload:
+        raw_frequency = payload.get("frequency")
+        if not isinstance(raw_frequency, str):
+            raise_api_error(400, "INVALID_FREQUENCY", "frequency is required.")
+        frequency = normalize_spaces(raw_frequency).lower()
+        if frequency not in FIXED_EXPENSE_FREQUENCIES:
+            raise_api_error(
+                400, "INVALID_FREQUENCY", f"Unsupported frequency: {raw_frequency}"
+            )
+        data["frequency"] = frequency
+
+    if not partial or "day_of_month" in payload:
+        data["day_of_month"] = parse_optional_int_field(
+            payload.get("day_of_month"), "day_of_month", 1, 31
+        )
+
+    if not partial or "day_of_week" in payload:
+        data["day_of_week"] = parse_optional_int_field(
+            payload.get("day_of_week"), "day_of_week", 0, 6
+        )
+
+    if not partial or "start_date" in payload:
+        data["start_date"] = parse_iso_date_field(
+            payload.get("start_date"), "start_date", required=True
+        )
+
+    if not partial or "end_date" in payload:
+        data["end_date"] = parse_iso_date_field(
+            payload.get("end_date"), "end_date", required=False
+        )
+
+    if "is_active" in payload:
+        if not isinstance(payload.get("is_active"), bool):
+            raise_api_error(422, "VALIDATION_ERROR", "is_active must be true or false.")
+        data["is_active"] = payload["is_active"]
+    elif not partial:
+        data["is_active"] = True
+
+    effective_frequency = data.get(
+        "frequency", existing.frequency if existing else None
+    )
+    effective_day_of_month = data.get(
+        "day_of_month", existing.day_of_month if existing else None
+    )
+    effective_day_of_week = data.get(
+        "day_of_week", existing.day_of_week if existing else None
+    )
+    effective_start_date = data.get(
+        "start_date", existing.start_date if existing else None
+    )
+    effective_end_date = data.get("end_date", existing.end_date if existing else None)
+
+    if effective_end_date is not None and effective_start_date is not None:
+        if effective_end_date < effective_start_date:
+            raise_api_error(
+                400,
+                "INVALID_DATE_RANGE",
+                "end_date must be on or after start_date",
+            )
+
+    if effective_frequency in {"weekly", "biweekly"}:
+        if effective_day_of_week is None:
+            raise_api_error(
+                400,
+                "INVALID_DAY_CONFIG",
+                "Weekly/biweekly requires day_of_week; others require day_of_month",
+            )
+        data["day_of_month"] = None
+    else:
+        if effective_day_of_month is None:
+            raise_api_error(
+                400,
+                "INVALID_DAY_CONFIG",
+                "Weekly/biweekly requires day_of_week; others require day_of_month",
+            )
+        data["day_of_week"] = None
+
+    return data
+
+
+def clamp_day_of_month(year: int, month: int, day: int) -> int:
+    return min(day, monthrange(year, month)[1])
+
+
+def month_delta(start: date, target: date) -> int:
+    return (target.year - start.year) * 12 + (target.month - start.month)
+
+
+def compute_due_dates(expense: "FixedExpense", target_date: date) -> list[date]:
+    if expense.frequency in {"weekly", "biweekly"}:
+        current = date(target_date.year, target_date.month, 1)
+        results: list[date] = []
+        while current.month == target_date.month:
+            if current.weekday() == expense.day_of_week:
+                if expense.frequency == "weekly":
+                    results.append(current)
+                else:
+                    delta_days = (current - expense.start_date).days
+                    if delta_days >= 0 and delta_days % 14 == 0:
+                        results.append(current)
+            current += timedelta(days=1)
+        return results
+
+    interval = FIXED_EXPENSE_MONTH_INTERVALS[expense.frequency]
+    delta_months = month_delta(expense.start_date, target_date)
+    if delta_months < 0 or delta_months % interval != 0:
+        return []
+
+    due_day = clamp_day_of_month(
+        target_date.year,
+        target_date.month,
+        expense.day_of_month or expense.start_date.day,
+    )
+    return [date(target_date.year, target_date.month, due_day)]
+
+
+def compute_generation_hash(fixed_expense_id: str, reference_date: str) -> str:
+    return hashlib.sha256(
+        f"{fixed_expense_id}:{reference_date}".encode("utf-8")
+    ).hexdigest()
+
+
+def generate_fixed_expense_entries(
+    session: Session,
+    target_date: date,
+    fixed_expense_id: str | None = None,
+) -> dict[str, Any]:
+    query = select(FixedExpense).where(FixedExpense.is_active.is_(True))
+    if fixed_expense_id:
+        query = query.where(FixedExpense.id == str(fixed_expense_id))
+
+    expenses = (
+        session.execute(
+            query.order_by(FixedExpense.created_at.asc(), FixedExpense.id.asc())
+        )
+        .scalars()
+        .all()
+    )
+
+    if fixed_expense_id and not expenses:
+        raise_api_error(404, "NOT_FOUND", f"Fixed expense {fixed_expense_id} not found")
+
+    generated = 0
+    skipped = 0
+    errors: list[dict[str, Any]] = []
+
+    for expense in expenses:
+        try:
+            for due_date in compute_due_dates(expense, target_date):
+                if due_date < expense.start_date:
+                    continue
+                if expense.end_date is not None and due_date > expense.end_date:
+                    continue
+
+                reference_date = due_date.isoformat()
+                generation_hash = compute_generation_hash(expense.id, reference_date)
+
+                existing_entry = session.execute(
+                    select(FixedExpenseEntry.id).where(
+                        FixedExpenseEntry.generation_hash == generation_hash
+                    )
+                ).scalar_one_or_none()
+                if existing_entry is not None:
+                    skipped += 1
+                    continue
+
+                session.add(
+                    FixedExpenseEntry(
+                        id=str(uuid4()),
+                        fixed_expense_id=expense.id,
+                        reference_date=due_date,
+                        due_date=due_date,
+                        amount=expense.amount,
+                        transaction_id=None,
+                        status="pending",
+                        generation_hash=generation_hash,
+                        created_at=utc_now(),
+                        updated_at=utc_now(),
+                    )
+                )
+                session.flush()
+                generated += 1
+        except HTTPException:
+            raise
+        except Exception as exc:
+            errors.append({"fixed_expense_id": expense.id, "error": str(exc)})
+
+    return {
+        "generated_count": generated,
+        "skipped_count": skipped,
+        "errors": errors,
     }
 
 
@@ -823,12 +1419,23 @@ class ImportErrorModel(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
 
 
+class Account(Base):
+    __tablename__ = "accounts"
+
+    id = Column(String(36), primary_key=True)
+    name = Column(String(100), nullable=False, unique=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
 class Transaction(Base):
     __tablename__ = "transaction"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     import_file_id = Column(String(36), nullable=True, index=True)
-    account_id = Column(String(36), nullable=True)
+    account_id = Column(String(36), nullable=True, index=True)
     date = Column(Date, nullable=False, index=True)
     description = Column(String(500), nullable=False)
     amount = Column(Numeric(14, 2), nullable=False)
@@ -852,6 +1459,72 @@ class Category(Base):
     color = Column(String(7), nullable=False, default=CATEGORY_COLOR_DEFAULT)
     icon = Column(String(50), nullable=True)
     is_system = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
+class TransactionAuditLog(Base):
+    __tablename__ = "transaction_audit_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    transaction_id = Column(
+        Integer,
+        ForeignKey("transaction.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    old_category_id = Column(
+        Integer, ForeignKey("categories.id", ondelete="SET NULL"), nullable=True
+    )
+    new_category_id = Column(
+        Integer, ForeignKey("categories.id", ondelete="SET NULL"), nullable=True
+    )
+    changed_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+
+class FixedExpense(Base):
+    __tablename__ = "fixed_expenses"
+
+    id = Column(String(36), primary_key=True)
+    account_id = Column(String(36), nullable=False, index=True)
+    category_id = Column(
+        Integer, ForeignKey("categories.id", ondelete="SET NULL"), nullable=True
+    )
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    amount = Column(Numeric(14, 2), nullable=False)
+    frequency = Column(String(20), nullable=False)
+    day_of_month = Column(Integer, nullable=True)
+    day_of_week = Column(Integer, nullable=True)
+    start_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
+class FixedExpenseEntry(Base):
+    __tablename__ = "fixed_expense_entries"
+
+    id = Column(String(36), primary_key=True)
+    fixed_expense_id = Column(
+        String(36),
+        ForeignKey("fixed_expenses.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    reference_date = Column(Date, nullable=False, index=True)
+    due_date = Column(Date, nullable=False, index=True)
+    amount = Column(Numeric(14, 2), nullable=False)
+    transaction_id = Column(
+        Integer, ForeignKey("transaction.id", ondelete="SET NULL"), nullable=True
+    )
+    status = Column(String(20), nullable=False, default="pending", index=True)
+    generation_hash = Column(String(64), nullable=False, unique=True, index=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at = Column(
         DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
@@ -1559,6 +2232,7 @@ async def upload_files(
     session = SessionLocal()
     try:
         batch_id = str(uuid4())
+        ensure_account(session, account_id)
         batch = ImportBatch(
             id=batch_id,
             account_id=account_id,
@@ -1764,6 +2438,55 @@ def list_batches(
         session.close()
 
 
+@app.get("/api/v1/accounts")
+def list_accounts():
+    session = SessionLocal()
+    try:
+        rows = (
+            session.execute(select(Account).order_by(Account.name.asc()))
+            .scalars()
+            .all()
+        )
+        items = [serialize_account(row) for row in rows]
+        seen = {item["id"] for item in items}
+
+        transaction_account_ids = (
+            session.execute(
+                select(Transaction.account_id)
+                .where(Transaction.account_id.is_not(None))
+                .distinct()
+            )
+            .scalars()
+            .all()
+        )
+        batch_account_ids = (
+            session.execute(
+                select(ImportBatch.account_id)
+                .where(ImportBatch.account_id.is_not(None))
+                .distinct()
+            )
+            .scalars()
+            .all()
+        )
+
+        for account_id in [*transaction_account_ids, *batch_account_ids]:
+            if account_id and account_id not in seen:
+                items.append(
+                    {
+                        "id": account_id,
+                        "name": account_id,
+                        "created_at": None,
+                        "updated_at": None,
+                    }
+                )
+                seen.add(account_id)
+
+        items.sort(key=lambda item: (item["name"] or item["id"]).lower())
+        return {"items": items, "total": len(items)}
+    finally:
+        session.close()
+
+
 @app.get("/api/v1/categories")
 def list_categories(include_system: bool = True):
     session = SessionLocal()
@@ -1772,7 +2495,8 @@ def list_categories(include_system: bool = True):
         if not include_system:
             query = query.where(Category.is_system.is_(False))
         rows = session.execute(query.order_by(Category.name.asc())).scalars().all()
-        return {"data": [serialize_category(row) for row in rows], "total": len(rows)}
+        items = [serialize_category(row) for row in rows]
+        return {"items": items, "data": items, "total": len(items)}
     finally:
         session.close()
 
@@ -2144,29 +2868,35 @@ def list_transactions(
     sort_by: str = Query("date"),
     sort_order: str = Query("desc"),
 ):
+    sort_by, sort_order = validate_transaction_sort(sort_by, sort_order)
+    parsed_date_from, parsed_date_to = parse_transaction_dates(date_from, date_to)
+    normalized_search = normalize_spaces(search) if search else None
+    if normalized_search:
+        normalized_search = normalized_search[:100]
+
     session = SessionLocal()
     try:
         query = select(Transaction)
-        if date_from:
-            query = query.where(Transaction.date >= parse_date(date_from))
-        if date_to:
-            query = query.where(Transaction.date <= parse_date(date_to))
+        if parsed_date_from:
+            query = query.where(Transaction.date >= parsed_date_from)
+        if parsed_date_to:
+            query = query.where(Transaction.date <= parsed_date_to)
         if category_id is not None:
             if category_id == 0:
                 query = query.where(Transaction.category_id.is_(None))
             else:
                 query = query.where(Transaction.category_id == category_id)
-        if account_id is not None:
+        if account_id not in (None, ""):
             query = query.where(Transaction.account_id == account_id)
-        if search:
-            query = query.where(Transaction.description.ilike(f"%{search}%"))
+        if normalized_search:
+            query = query.where(Transaction.description.ilike(f"%{normalized_search}%"))
 
         sort_map = {
             "date": Transaction.date,
             "amount": Transaction.amount,
             "description": Transaction.description,
         }
-        sort_column = sort_map.get(sort_by, Transaction.date)
+        sort_column = sort_map[sort_by]
         if sort_order == "asc":
             query = query.order_by(sort_column.asc(), Transaction.id.asc())
         else:
@@ -2206,22 +2936,24 @@ def get_transaction(transaction_id: int):
 @app.patch("/api/v1/transactions/{transaction_id}")
 async def patch_transaction_category(transaction_id: int, request: Request):
     payload = await request.json()
-    if not isinstance(payload, dict) or set(payload) - {"category_id"}:
+    if not isinstance(payload, dict):
+        raise_api_error(400, "VALIDATION_ERROR", "Request body must be a JSON object.")
+    if set(payload) - {"category_id"}:
         raise_api_error(
-            400, "INVALID_CATEGORY_NAME", "Request body contains disallowed fields."
+            400, "DISALLOWED_FIELDS", "Request body contains disallowed fields."
         )
+    if "category_id" not in payload:
+        raise_api_error(400, "VALIDATION_ERROR", "category_id is required.")
+
     session = SessionLocal()
     try:
         transaction = get_transaction_or_404(session, transaction_id)
-        category_id = payload.get("category_id")
-        if category_id == "":
-            raise_api_error(422, "VALIDATION_ERROR", "category_id must be null or int.")
-        if category_id is None:
-            apply_transaction_category(session, transaction, None, "manual")
-        else:
-            category = get_category_or_404(session, int(category_id))
-            apply_transaction_category(session, transaction, category.id, "manual")
+        category_id = parse_optional_transaction_category_id(
+            session, payload.get("category_id")
+        )
+        apply_transaction_category(session, transaction, category_id, "manual")
         session.commit()
+        session.refresh(transaction)
         return serialize_transaction(session, transaction)
     finally:
         session.close()
@@ -2236,39 +2968,315 @@ async def bulk_update_transaction_categories(request: Request):
             "EMPTY_TRANSACTION_LIST",
             "transaction_ids must contain at least one ID.",
         )
+    if "category_id" not in payload:
+        raise_api_error(400, "VALIDATION_ERROR", "category_id is required.")
+
     transaction_ids = validate_transaction_ids(payload.get("transaction_ids"))
-    category_id = payload.get("category_id")
     session = SessionLocal()
     try:
-        if category_id == "":
-            raise_api_error(422, "VALIDATION_ERROR", "category_id must be null or int.")
-        if category_id is not None:
-            category = get_category_or_404(session, int(category_id))
-            category_id = category.id
+        category_id = parse_optional_transaction_category_id(
+            session, payload.get("category_id")
+        )
 
-        found = (
+        found_rows = (
             session.execute(
                 select(Transaction).where(Transaction.id.in_(transaction_ids))
             )
             .scalars()
             .all()
         )
-        found_ids = {row.id for row in found}
-        missing = [tx_id for tx_id in transaction_ids if tx_id not in found_ids]
-        for transaction in found:
-            apply_transaction_category(session, transaction, category_id, "bulk")
+        found_by_id = {row.id: row for row in found_rows}
+
+        updated_ids: list[int] = []
+        errors: list[dict[str, Any]] = []
+
+        for requested_id in transaction_ids:
+            transaction = found_by_id.get(requested_id)
+            if transaction is None:
+                errors.append(
+                    {
+                        "transaction_id": requested_id,
+                        "error": "TRANSACTION_NOT_FOUND",
+                        "message": f"Transaction with id {requested_id} does not exist",
+                    }
+                )
+                continue
+
+            if apply_transaction_category(session, transaction, category_id, "bulk"):
+                updated_ids.append(transaction.id)
+
         session.commit()
+
         response = {
-            "updated_count": len(found),
-            "transaction_ids": [row.id for row in found],
+            "updated_count": len(updated_ids),
+            "transaction_ids": updated_ids,
         }
-        if missing:
-            response["errors"] = [
-                {"transaction_id": tx_id, "error": "TRANSACTION_NOT_FOUND"}
-                for tx_id in missing
-            ]
+        if errors:
+            response["errors"] = errors
             return JSONResponse(status_code=207, content=response)
         return response
+    finally:
+        session.close()
+
+
+@app.post("/api/v1/fixed-expenses", status_code=201)
+async def create_fixed_expense(request: Request):
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise_api_error(400, "VALIDATION_ERROR", "Request body must be a JSON object.")
+
+    session = SessionLocal()
+    try:
+        data = validate_fixed_expense_payload(session, payload, partial=False)
+        ensure_account(session, data["account_id"])
+
+        expense = FixedExpense(
+            id=str(uuid4()),
+            account_id=data["account_id"],
+            category_id=data.get("category_id"),
+            name=data["name"],
+            description=data.get("description"),
+            amount=data["amount"],
+            frequency=data["frequency"],
+            day_of_month=data.get("day_of_month"),
+            day_of_week=data.get("day_of_week"),
+            start_date=data["start_date"],
+            end_date=data.get("end_date"),
+            is_active=data.get("is_active", True),
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        session.add(expense)
+        session.commit()
+        session.refresh(expense)
+        return serialize_fixed_expense(session, expense)
+    finally:
+        session.close()
+
+
+@app.get("/api/v1/fixed-expenses")
+def list_fixed_expenses(
+    account_id: str | None = None,
+    is_active: bool | None = Query(True),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    session = SessionLocal()
+    try:
+        query = select(FixedExpense)
+        if account_id not in (None, ""):
+            query = query.where(FixedExpense.account_id == account_id)
+        if is_active is not None:
+            query = query.where(FixedExpense.is_active.is_(is_active))
+
+        total = session.execute(
+            select(func.count()).select_from(query.subquery())
+        ).scalar_one()
+        rows = (
+            session.execute(
+                query.order_by(FixedExpense.created_at.desc(), FixedExpense.id.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+            .scalars()
+            .all()
+        )
+
+        return {
+            "items": [serialize_fixed_expense(session, row) for row in rows],
+            "total": int(total or 0),
+            "page": page,
+            "page_size": page_size,
+            "total_pages": max(1, (int(total or 0) + page_size - 1) // page_size),
+        }
+    finally:
+        session.close()
+
+
+@app.post("/api/v1/fixed-expenses/generate")
+async def generate_fixed_expenses(request: Request):
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise_api_error(400, "VALIDATION_ERROR", "Request body must be a JSON object.")
+
+    target_date = parse_iso_date_field(payload.get("target_date"), "target_date")
+    fixed_expense_id = payload.get("fixed_expense_id")
+    if fixed_expense_id == "":
+        fixed_expense_id = None
+    if fixed_expense_id is not None:
+        fixed_expense_id = normalize_spaces(str(fixed_expense_id))
+
+    session = SessionLocal()
+    try:
+        result = generate_fixed_expense_entries(
+            session, target_date, fixed_expense_id=fixed_expense_id
+        )
+        session.commit()
+        return result
+    finally:
+        session.close()
+
+
+@app.patch("/api/v1/fixed-expenses/entries/{entry_id}")
+async def update_fixed_expense_entry(entry_id: str, request: Request):
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise_api_error(400, "VALIDATION_ERROR", "Request body must be a JSON object.")
+
+    allowed = {"status", "transaction_id"}
+    if set(payload) - allowed:
+        raise_api_error(400, "VALIDATION_ERROR", "Unexpected fields in request.")
+
+    session = SessionLocal()
+    try:
+        entry = get_fixed_expense_entry_or_404(session, entry_id)
+
+        if "status" in payload:
+            status = payload.get("status")
+            if not isinstance(status, str):
+                raise_api_error(400, "VALIDATION_ERROR", "status must be text.")
+            normalized_status = normalize_spaces(status).lower()
+            if normalized_status not in FIXED_EXPENSE_ENTRY_STATUSES:
+                raise_api_error(400, "VALIDATION_ERROR", "Invalid status.")
+            entry.status = normalized_status
+
+        if "transaction_id" in payload:
+            transaction_id = payload.get("transaction_id")
+            if transaction_id == "":
+                raise_api_error(
+                    422, "VALIDATION_ERROR", "transaction_id must be null or int."
+                )
+            if transaction_id is None:
+                entry.transaction_id = None
+            else:
+                if isinstance(transaction_id, bool):
+                    raise_api_error(
+                        422, "VALIDATION_ERROR", "transaction_id must be null or int."
+                    )
+                try:
+                    parsed_transaction_id = int(transaction_id)
+                except Exception:
+                    raise_api_error(
+                        422, "VALIDATION_ERROR", "transaction_id must be null or int."
+                    )
+                get_transaction_or_404(session, parsed_transaction_id)
+                entry.transaction_id = parsed_transaction_id
+
+        entry.updated_at = utc_now()
+        session.commit()
+        session.refresh(entry)
+        return serialize_fixed_expense_entry(session, entry)
+    finally:
+        session.close()
+
+
+@app.get("/api/v1/fixed-expenses/{expense_id}/entries")
+def list_fixed_expense_entries(
+    expense_id: str,
+    status: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    session = SessionLocal()
+    try:
+        expense = get_fixed_expense_or_404(session, expense_id)
+        query = select(FixedExpenseEntry).where(
+            FixedExpenseEntry.fixed_expense_id == expense.id
+        )
+
+        if status:
+            normalized_status = normalize_spaces(status).lower()
+            if normalized_status not in FIXED_EXPENSE_ENTRY_STATUSES:
+                raise_api_error(400, "VALIDATION_ERROR", "Invalid status.")
+            query = query.where(FixedExpenseEntry.status == normalized_status)
+
+        if from_date:
+            query = query.where(
+                FixedExpenseEntry.reference_date
+                >= parse_iso_date_field(from_date, "from_date")
+            )
+        if to_date:
+            query = query.where(
+                FixedExpenseEntry.reference_date
+                <= parse_iso_date_field(to_date, "to_date")
+            )
+
+        total = session.execute(
+            select(func.count()).select_from(query.subquery())
+        ).scalar_one()
+        rows = (
+            session.execute(
+                query.order_by(
+                    FixedExpenseEntry.due_date.desc(), FixedExpenseEntry.id.desc()
+                )
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+            .scalars()
+            .all()
+        )
+
+        return {
+            "items": [serialize_fixed_expense_entry(session, row) for row in rows],
+            "total": int(total or 0),
+            "page": page,
+            "page_size": page_size,
+            "total_pages": max(1, (int(total or 0) + page_size - 1) // page_size),
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/v1/fixed-expenses/{expense_id}")
+def get_fixed_expense(expense_id: str):
+    session = SessionLocal()
+    try:
+        expense = get_fixed_expense_or_404(session, expense_id)
+        return serialize_fixed_expense(session, expense)
+    finally:
+        session.close()
+
+
+@app.patch("/api/v1/fixed-expenses/{expense_id}")
+async def update_fixed_expense(expense_id: str, request: Request):
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise_api_error(400, "VALIDATION_ERROR", "Request body must be a JSON object.")
+
+    session = SessionLocal()
+    try:
+        expense = get_fixed_expense_or_404(session, expense_id)
+        data = validate_fixed_expense_payload(
+            session, payload, partial=True, existing=expense
+        )
+
+        if "account_id" in data:
+            ensure_account(session, data["account_id"])
+
+        for field_name, value in data.items():
+            setattr(expense, field_name, value)
+
+        expense.updated_at = utc_now()
+        session.commit()
+        session.refresh(expense)
+        return serialize_fixed_expense(session, expense)
+    finally:
+        session.close()
+
+
+@app.delete("/api/v1/fixed-expenses/{expense_id}", status_code=204)
+def delete_fixed_expense(expense_id: str):
+    session = SessionLocal()
+    try:
+        expense = get_fixed_expense_or_404(session, expense_id)
+        today = date.today()
+        expense.is_active = False
+        expense.end_date = today if today >= expense.start_date else expense.start_date
+        expense.updated_at = utc_now()
+        session.commit()
+        return Response(status_code=204)
     finally:
         session.close()
 
