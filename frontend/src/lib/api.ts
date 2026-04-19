@@ -560,3 +560,195 @@ export interface AccountListResponse {
 export async function listAccounts(): Promise<AccountListResponse> {
   return requestJson<AccountListResponse>("/accounts");
 }
+
+// ── Fixed Expenses ────────────────────────────────────────────────────────────
+
+export type FixedExpenseFrequency =
+  | "weekly"
+  | "biweekly"
+  | "monthly"
+  | "bimonthly"
+  | "quarterly"
+  | "semiannual"
+  | "annual";
+
+export type FixedExpenseEntryStatus =
+  | "pending"
+  | "paid"
+  | "skipped"
+  | "cancelled";
+
+export interface FixedExpenseItem {
+  id: string;
+  account_id: string;
+  account_name: string;
+  category_id: number | null;
+  category_name: string | null;
+  name: string;
+  description: string | null;
+  amount: string;
+  frequency: FixedExpenseFrequency;
+  day_of_month: number | null;
+  day_of_week: number | null;
+  start_date: string;
+  end_date: string | null;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FixedExpenseEntryItem {
+  id: string;
+  fixed_expense_id: string;
+  reference_date: string;
+  due_date: string;
+  amount: string;
+  transaction_id: number | null;
+  transaction: TransactionItem | null;
+  status: FixedExpenseEntryStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FixedExpenseListResponse {
+  items: FixedExpenseItem[];
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+}
+
+export interface FixedExpenseEntryListResponse {
+  items: FixedExpenseEntryItem[];
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+}
+
+export interface GenerationResult {
+  generated_count: number;
+  skipped_count: number;
+  errors: Array<{ fixed_expense_id: string; error: string }>;
+}
+
+export interface CreateFixedExpenseInput {
+  account_id: string;
+  category_id?: number | null;
+  name: string;
+  description?: string | null;
+  amount: string | number;
+  frequency: FixedExpenseFrequency;
+  day_of_month?: number | null;
+  day_of_week?: number | null;
+  start_date: string;
+  end_date?: string | null;
+}
+
+export interface UpdateFixedExpenseInput {
+  name?: string;
+  description?: string | null;
+  category_id?: number | null;
+  amount?: string | number;
+  frequency?: FixedExpenseFrequency;
+  day_of_month?: number | null;
+  day_of_week?: number | null;
+  end_date?: string | null;
+  is_active?: boolean;
+}
+
+export async function listFixedExpenses(
+  params: {
+    account_id?: string | null;
+    is_active?: boolean;
+    page?: number;
+    page_size?: number;
+  } = {},
+): Promise<FixedExpenseListResponse> {
+  return requestJson<FixedExpenseListResponse>(
+    `/fixed-expenses${toQueryString({
+      account_id: params.account_id ?? undefined,
+      is_active: params.is_active ?? undefined,
+      page: params.page ?? 1,
+      page_size: params.page_size ?? 20,
+    })}`,
+  );
+}
+
+export async function getFixedExpense(id: string): Promise<FixedExpenseItem> {
+  return requestJson<FixedExpenseItem>(
+    `/fixed-expenses/${encodeURIComponent(id)}`,
+  );
+}
+
+export async function createFixedExpense(
+  input: CreateFixedExpenseInput,
+): Promise<FixedExpenseItem> {
+  return requestJson<FixedExpenseItem>("/fixed-expenses", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function updateFixedExpense(
+  id: string,
+  input: UpdateFixedExpenseInput,
+): Promise<FixedExpenseItem> {
+  return requestJson<FixedExpenseItem>(
+    `/fixed-expenses/${encodeURIComponent(id)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    },
+  );
+}
+
+export async function deleteFixedExpense(id: string): Promise<void> {
+  await requestJson<void>(`/fixed-expenses/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function listFixedExpenseEntries(
+  expenseId: string,
+  params: {
+    status?: string | null;
+    from_date?: string | null;
+    to_date?: string | null;
+    page?: number;
+    page_size?: number;
+  } = {},
+): Promise<FixedExpenseEntryListResponse> {
+  return requestJson<FixedExpenseEntryListResponse>(
+    `/fixed-expenses/${encodeURIComponent(expenseId)}/entries${toQueryString({
+      status: params.status ?? undefined,
+      from_date: params.from_date ?? undefined,
+      to_date: params.to_date ?? undefined,
+      page: params.page ?? 1,
+      page_size: params.page_size ?? 20,
+    })}`,
+  );
+}
+
+export async function generateFixedExpenseEntries(input: {
+  target_date: string;
+  fixed_expense_id?: string | null;
+}): Promise<GenerationResult> {
+  return requestJson<GenerationResult>("/fixed-expenses/generate", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function updateFixedExpenseEntryStatus(
+  entryId: string,
+  input: { status: FixedExpenseEntryStatus; transaction_id?: number | null },
+): Promise<FixedExpenseEntryItem> {
+  return requestJson<FixedExpenseEntryItem>(
+    `/fixed-expenses/entries/${encodeURIComponent(entryId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    },
+  );
+}

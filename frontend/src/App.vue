@@ -6,8 +6,9 @@ import Badge from './components/ui/Badge.vue'
 import IngestionSection from './components/IngestionSection.vue'
 import CategorizationSection from './components/CategorizationSection.vue'
 import TransactionsSection from './components/TransactionsSection.vue'
+import FixedExpensesSection from './components/fixedExpenses/FixedExpensesSection.vue'
 
-type TabKey = 'ingestion' | 'categorization' | 'transactions'
+type TabKey = 'ingestion' | 'categorization' | 'transactions' | 'fixed-expenses'
 
 const tabs: Array<{
   key: TabKey
@@ -28,6 +29,11 @@ const tabs: Array<{
     key: 'transactions',
     label: 'Transactions',
     description: 'Review transactions, edit category, bulk apply changes.',
+  },
+  {
+    key: 'fixed-expenses',
+    label: 'SPEC4 · Fixed Expenses',
+    description: 'Manage recurring expenses and generate periodic entries.',
   },
 ]
 
@@ -83,7 +89,8 @@ const activeTabMeta = computed(
         <div class="panelBody">
           <IngestionSection v-if="activeTab === 'ingestion'" />
           <CategorizationSection v-else-if="activeTab === 'categorization'" />
-          <TransactionsSection v-else />
+          <TransactionsSection v-else-if="activeTab === 'transactions'" />
+          <FixedExpensesSection v-else-if="activeTab === 'fixed-expenses'" />
         </div>
       </Card>
     </main>
