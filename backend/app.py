@@ -44,6 +44,7 @@ from sqlalchemy import (
     create_engine,
     desc,
     func,
+    inspect,
     or_,
     select,
 )
@@ -1424,6 +1425,13 @@ class Account(Base):
 
     id = Column(String(36), primary_key=True)
     name = Column(String(100), nullable=False, unique=True)
+
+    # Dashboard / credit-card billing fields (runtime-added via schema patch)
+    type = Column(String(50), nullable=True)
+    closing_day = Column(Integer, nullable=True)
+    due_day = Column(Integer, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+
     created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at = Column(
         DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
@@ -1550,6 +1558,32 @@ class CategorizationRule(Base):
 
 
 Base.metadata.create_all(bind=engine)
+
+
+def ensure_account_credit_card_columns() -> None:
+    # Ensure schema contains fields needed by SPEC5 dashboard credit-card logic.
+    # Idempotent: only adds missing columns.
+    insp = inspect(engine)
+    try:
+        cols = {c["name"] for c in insp.get_columns("accounts")}
+    except Exception:
+        return
+
+    with engine.begin() as conn:
+        if "type" not in cols:
+            conn.exec_driver_sql('ALTER TABLE accounts ADD COLUMN "type" VARCHAR(50)')
+        if "closing_day" not in cols:
+            conn.exec_driver_sql("ALTER TABLE accounts ADD COLUMN closing_day INTEGER")
+        if "due_day" not in cols:
+            conn.exec_driver_sql("ALTER TABLE accounts ADD COLUMN due_day INTEGER")
+        if "is_active" not in cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE accounts ADD COLUMN is_active BOOLEAN DEFAULT 1"
+            )
+
+
+ensure_account_credit_card_columns()
+
 with SessionLocal() as _seed_session:
     ensure_system_category(_seed_session)
 
@@ -3387,6 +3421,526 @@ async def run_categorization(request: Request):
     finally:
         session.close()
         _categorization_lock.release()
+
+
+def _validate_month_year(month: int, year: int) -> None:
+    if not (1 <= month <= 12):
+        raise_api_error(
+            400,
+            "INVALID_MONTH",
+            "month must be between 1 and 12",
+        )
+
+    current_year = date.today().year
+    if not (2000 <= year <= current_year + 1):
+        raise_api_error(
+            400,
+            "INVALID_YEAR",
+            f"year must be between 2000 and {current_year + 1}",
+        )
+
+
+def _month_bounds(month: int, year: int) -> tuple[date, date]:
+    last_day = monthrange(year, month)[1]
+    return date(year, month, 1), date(year, month, last_day)
+
+
+def _first_day_of_month(d: date) -> date:
+    return date(d.year, d.month, 1)
+
+
+def _add_months(year: int, month: int, delta: int) -> tuple[int, int]:
+    # month: 1..12
+    m0 = month - 1 + delta
+    y = year + (m0 // 12)
+    m = (m0 % 12) + 1
+    return y, m
+
+
+def _serialize_period(start: date, end: date) -> dict[str, str]:
+    return {"start": start.isoformat(), "end": end.isoformat()}
+
+
+def _to_float(v: Any) -> float:
+    if v is None:
+        return 0.0
+    if isinstance(v, Decimal):
+        return float(v)
+    return float(v)
+
+
+@app.get("/api/v1/dashboard/monthly-summary")
+def get_monthly_summary(
+    month: int | None = Query(None, ge=1, le=12),
+    year: int | None = Query(None),
+):
+    today = date.today()
+    month_eff = month if month is not None else today.month
+    year_eff = year if year is not None else today.year
+
+    _validate_month_year(month_eff, year_eff)
+    start_date, end_date = _month_bounds(month_eff, year_eff)
+
+    session = SessionLocal()
+    try:
+        rows = session.execute(
+            select(
+                Transaction.category_id,
+                Category.name.label("category_name"),
+                Transaction.type,
+                func.count(Transaction.id).label("transaction_count"),
+                func.coalesce(func.sum(Transaction.amount), 0).label("total"),
+            )
+            .select_from(Transaction)
+            .outerjoin(Category, Category.id == Transaction.category_id)
+            .where(Transaction.date >= start_date, Transaction.date <= end_date)
+            .where(Transaction.type.in_(["debit", "credit"]))
+            .group_by(Transaction.category_id, Category.name, Transaction.type)
+        ).all()
+
+        total_expenses = Decimal("0.00")
+        total_income = Decimal("0.00")
+
+        expenses: list[dict[str, Any]] = []
+
+        for r in rows:
+            tx_type = r.type
+            tx_total = r.total if r.total is not None else Decimal("0.00")
+            if tx_type == "debit":
+                total_expenses += tx_total
+                expenses.append(
+                    {
+                        "category_id": r.category_id,
+                        "category_name": r.category_name or "Sem Categoria",
+                        "total": tx_total,
+                        "transaction_count": r.transaction_count,
+                    }
+                )
+            elif tx_type == "credit":
+                total_income += tx_total
+
+        categories: list[dict[str, Any]] = []
+        expenses_sorted = sorted(expenses, key=lambda x: x["total"], reverse=True)
+        for item in expenses_sorted:
+            pct = (
+                round((item["total"] / total_expenses) * 100, 2)
+                if total_expenses > 0
+                else Decimal("0.00")
+            )
+            categories.append(
+                {
+                    "category_id": item["category_id"],
+                    "category_name": item["category_name"],
+                    "total": _to_float(item["total"]),
+                    "percentage": _to_float(pct),
+                    "transaction_count": int(item["transaction_count"] or 0),
+                }
+            )
+
+        net = total_income - total_expenses
+        return {
+            "month": month_eff,
+            "year": year_eff,
+            "total_expenses": _to_float(total_expenses),
+            "total_income": _to_float(total_income),
+            "net": _to_float(net),
+            "categories": categories,
+        }
+    except Exception:
+        raise_api_error(
+            500, "AGGREGATION_FAILED", "Failed to compute dashboard aggregation"
+        )
+    finally:
+        session.close()
+
+
+@app.get("/api/v1/dashboard/charts/category-breakdown")
+def get_category_breakdown(
+    month: int | None = Query(None, ge=1, le=12),
+    year: int | None = Query(None),
+):
+    today = date.today()
+    month_eff = month if month is not None else today.month
+    year_eff = year if year is not None else today.year
+
+    _validate_month_year(month_eff, year_eff)
+    start_date, end_date = _month_bounds(month_eff, year_eff)
+
+    session = SessionLocal()
+    try:
+        rows = session.execute(
+            select(
+                Transaction.category_id,
+                Category.name.label("category_name"),
+                Category.color.label("category_color"),
+                func.count(Transaction.id).label("transaction_count"),
+                func.coalesce(func.sum(Transaction.amount), 0).label("total"),
+            )
+            .select_from(Transaction)
+            .outerjoin(Category, Category.id == Transaction.category_id)
+            .where(Transaction.date >= start_date, Transaction.date <= end_date)
+            .where(Transaction.type == "debit")
+            .group_by(Transaction.category_id, Category.name, Category.color)
+        ).all()
+
+        total_expenses = sum((r.total or Decimal("0.00")) for r in rows)
+
+        slices: list[dict[str, Any]] = []
+        uncategorized_total = Decimal("0.00")
+
+        for r in rows:
+            if r.category_id is None:
+                uncategorized_total += r.total or Decimal("0.00")
+                continue
+
+            color = r.category_color or "#9E9E9E"
+            if not color:
+                color = "#9E9E9E"
+
+            pct = (
+                round(((r.total or Decimal("0.00")) / total_expenses) * 100, 2)
+                if total_expenses > 0
+                else Decimal("0.00")
+            )
+
+            slices.append(
+                {
+                    "category_id": r.category_id,
+                    "category_name": r.category_name or "Sem Categoria",
+                    "total": _to_float(r.total),
+                    "percentage": _to_float(pct),
+                    "color": color,
+                }
+            )
+
+        # Sort slices by total desc (stable for chart)
+        slices = sorted(slices, key=lambda x: x["total"], reverse=True)
+
+        uncategorized_percentage = (
+            _to_float(round((uncategorized_total / total_expenses) * 100, 2))
+            if total_expenses > 0
+            else 0.0
+        )
+
+        return {
+            "month": month_eff,
+            "year": year_eff,
+            "slices": slices,
+            "uncategorized_total": _to_float(uncategorized_total),
+            "uncategorized_percentage": uncategorized_percentage,
+        }
+    except Exception:
+        raise_api_error(
+            500, "AGGREGATION_FAILED", "Failed to compute dashboard aggregation"
+        )
+    finally:
+        session.close()
+
+
+@app.get("/api/v1/dashboard/charts/time-series")
+def get_time_series(
+    month: int | None = Query(None, ge=1, le=12),
+    year: int | None = Query(None),
+    granularity: str | None = Query("daily"),
+    months_back: int | None = Query(6),
+):
+    today = date.today()
+    month_eff = month if month is not None else today.month
+    year_eff = year if year is not None else today.year
+
+    _validate_month_year(month_eff, year_eff)
+
+    if granularity not in ("daily", "monthly"):
+        raise_api_error(
+            400,
+            "INVALID_GRANULARITY",
+            'granularity must be "daily" or "monthly"',
+        )
+
+    months_back_eff = months_back if months_back is not None else 6
+    if not (1 <= months_back_eff <= 24):
+        raise_api_error(
+            400,
+            "INVALID_MONTHS_BACK",
+            "months_back must be between 1 and 24",
+        )
+
+    session = SessionLocal()
+    try:
+        if granularity == "daily":
+            start_date, end_date = _month_bounds(month_eff, year_eff)
+
+            rows = session.execute(
+                select(
+                    Transaction.date.label("d"),
+                    Transaction.type.label("t"),
+                    func.coalesce(func.sum(Transaction.amount), 0).label("total"),
+                )
+                .where(Transaction.date >= start_date, Transaction.date <= end_date)
+                .where(Transaction.type.in_(["debit", "credit"]))
+                .group_by(Transaction.date, Transaction.type)
+            ).all()
+
+            by_day: dict[date, dict[str, Decimal]] = {}
+            for r in rows:
+                day = r.d
+                by_day.setdefault(day, {})
+                by_day[day][r.t] = r.total
+
+            data_points: list[dict[str, Any]] = []
+            cumulative_expenses = Decimal("0.00")
+            cumulative_income = Decimal("0.00")
+
+            cur = start_date
+            while cur <= end_date:
+                expenses = by_day.get(cur, {}).get("debit", Decimal("0.00"))
+                income = by_day.get(cur, {}).get("credit", Decimal("0.00"))
+
+                cumulative_expenses += expenses
+                cumulative_income += income
+
+                data_points.append(
+                    {
+                        "date": cur.isoformat(),
+                        "total_expenses": _to_float(expenses),
+                        "total_income": _to_float(income),
+                    }
+                )
+                cur += timedelta(days=1)
+
+            return {
+                "granularity": "daily",
+                "period": _serialize_period(start_date, end_date),
+                "data_points": data_points,
+                "cumulative_expenses": _to_float(cumulative_expenses),
+                "cumulative_income": _to_float(cumulative_income),
+            }
+
+        # monthly
+        # Range: earliest month (months_back_eff-1 months ago) through end of current month
+        start_year, start_month = _add_months(
+            year_eff, month_eff, -(months_back_eff - 1)
+        )
+        start_date = date(start_year, start_month, 1)
+        end_start = date(year_eff, month_eff, 1)
+        end_day = monthrange(end_start.year, end_start.month)[1]
+        end_date = date(end_start.year, end_start.month, end_day)
+
+        rows = session.execute(
+            select(
+                Transaction.date.label("d"),
+                Transaction.type.label("t"),
+                func.coalesce(func.sum(Transaction.amount), 0).label("total"),
+            )
+            .where(Transaction.date >= start_date, Transaction.date <= end_date)
+            .where(Transaction.type.in_(["debit", "credit"]))
+            .group_by(Transaction.date, Transaction.type)
+        ).all()
+
+        totals_by_month: dict[date, dict[str, Decimal]] = {}
+        for r in rows:
+            mkey = _first_day_of_month(r.d)
+            totals_by_month.setdefault(mkey, {})
+            totals_by_month[mkey][r.t] = totals_by_month[mkey].get(
+                r.t, Decimal("0.00")
+            ) + (r.total or Decimal("0.00"))
+
+        data_points: list[dict[str, Any]] = []
+        cumulative_expenses = Decimal("0.00")
+        cumulative_income = Decimal("0.00")
+
+        y, m = start_year, start_month
+        for _ in range(months_back_eff):
+            mkey = date(y, m, 1)
+            expenses = totals_by_month.get(mkey, {}).get("debit", Decimal("0.00"))
+            income = totals_by_month.get(mkey, {}).get("credit", Decimal("0.00"))
+
+            cumulative_expenses += expenses
+            cumulative_income += income
+
+            data_points.append(
+                {
+                    "date": mkey.isoformat(),
+                    "total_expenses": _to_float(expenses),
+                    "total_income": _to_float(income),
+                }
+            )
+
+            y, m = _add_months(y, m, 1)
+
+        return {
+            "granularity": "monthly",
+            "period": _serialize_period(start_date, end_date),
+            "data_points": data_points,
+            "cumulative_expenses": _to_float(cumulative_expenses),
+            "cumulative_income": _to_float(cumulative_income),
+        }
+    except Exception:
+        raise_api_error(
+            500, "AGGREGATION_FAILED", "Failed to compute dashboard aggregation"
+        )
+    finally:
+        session.close()
+
+
+def _compute_invoice_status(
+    closing_date: date,
+    due_date: date,
+    has_payment: bool,
+    today: date | None = None,
+) -> str:
+    today_eff = today or date.today()
+    if has_payment:
+        return "paid"
+    if today_eff <= closing_date:
+        return "open"
+    if today_eff <= due_date:
+        return "closed"
+    return "overdue"
+
+
+@app.get("/api/v1/dashboard/card-tracking")
+def get_card_tracking(
+    month: int | None = Query(None, ge=1, le=12),
+    year: int | None = Query(None),
+):
+    today = date.today()
+    month_eff = month if month is not None else today.month
+    year_eff = year if year is not None else today.year
+    _validate_month_year(month_eff, year_eff)
+
+    session = SessionLocal()
+    try:
+        cards = (
+            session.execute(
+                select(Account)
+                .where(Account.is_active.is_(True))
+                .where(Account.type == "credit_card")
+            )
+            .scalars()
+            .all()
+        )
+
+        if not cards:
+            return {
+                "month": month_eff,
+                "year": year_eff,
+                "cards": [],
+                "upcoming_payments": [],
+                "total_card_debt": 0.0,
+            }
+
+        card_items: list[dict[str, Any]] = []
+        upcoming: list[dict[str, Any]] = []
+        total_card_debt = Decimal("0.00")
+
+        for card in cards:
+            closing_day = int(card.closing_day or 1)
+            due_day = int(card.due_day or 1)
+
+            closing_date = date(
+                year_eff,
+                month_eff,
+                clamp_day_of_month(year_eff, month_eff, closing_day),
+            )
+
+            # prev closing to build cycle_start
+            prev_year, prev_month = _add_months(year_eff, month_eff, -1)
+            prev_closing_date = date(
+                prev_year,
+                prev_month,
+                clamp_day_of_month(prev_year, prev_month, closing_day),
+            )
+            cycle_start = prev_closing_date + timedelta(days=1)
+            cycle_end = closing_date
+
+            invoice_sum = session.execute(
+                select(
+                    func.coalesce(func.sum(Transaction.amount), 0),
+                    func.count(Transaction.id),
+                )
+                .where(Transaction.account_id == str(card.id))
+                .where(Transaction.date >= cycle_start, Transaction.date <= cycle_end)
+                .where(Transaction.type == "debit")
+            ).one()
+
+            current_invoice_total = invoice_sum[0] or Decimal("0.00")
+            transaction_count = int(invoice_sum[1] or 0)
+
+            # due date can fall in next month
+            due_year, due_month = year_eff, month_eff
+            if due_day < closing_day:
+                due_year, due_month = _add_months(year_eff, month_eff, 1)
+
+            due_date = date(
+                due_year,
+                due_month,
+                clamp_day_of_month(due_year, due_month, due_day),
+            )
+
+            # payment detection (heuristic): credit tx up to due_date for this cycle
+            payment_count = session.execute(
+                select(func.count(Transaction.id))
+                .where(Transaction.account_id == str(card.id))
+                .where(Transaction.date >= cycle_start, Transaction.date <= due_date)
+                .where(Transaction.type == "credit")
+            ).scalar_one()
+
+            has_payment = int(payment_count or 0) > 0
+
+            status = _compute_invoice_status(
+                closing_date=closing_date,
+                due_date=due_date,
+                has_payment=has_payment,
+                today=today,
+            )
+
+            days_until_due = (due_date - today).days
+
+            if status != "paid":
+                total_card_debt += current_invoice_total
+
+            card_items.append(
+                {
+                    "account_id": card.id,
+                    "account_name": card.name,
+                    "current_invoice_total": _to_float(current_invoice_total),
+                    "transaction_count": transaction_count,
+                    "closing_date": closing_date.isoformat(),
+                    "due_date": due_date.isoformat(),
+                    "status": status,
+                    "days_until_due": days_until_due,
+                }
+            )
+
+            if status in ("open", "closed"):
+                is_urgent = days_until_due <= 5
+                upcoming.append(
+                    {
+                        "account_id": card.id,
+                        "account_name": card.name,
+                        "due_date": due_date.isoformat(),
+                        "amount": _to_float(current_invoice_total),
+                        "days_until_due": days_until_due,
+                        "is_urgent": bool(is_urgent),
+                    }
+                )
+
+        upcoming_sorted = sorted(upcoming, key=lambda x: x["due_date"])
+
+        return {
+            "month": month_eff,
+            "year": year_eff,
+            "cards": card_items,
+            "upcoming_payments": upcoming_sorted,
+            "total_card_debt": _to_float(total_card_debt),
+        }
+    except Exception:
+        raise_api_error(
+            500, "AGGREGATION_FAILED", "Failed to compute dashboard aggregation"
+        )
+    finally:
+        session.close()
 
 
 @app.get("/health")

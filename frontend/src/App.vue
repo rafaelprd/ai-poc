@@ -3,18 +3,24 @@ import { computed, ref } from 'vue'
 import Card from './components/ui/Card.vue'
 import Button from './components/ui/Button.vue'
 import Badge from './components/ui/Badge.vue'
+import DashboardSection from './components/dashboard/DashboardSection.vue'
 import IngestionSection from './components/IngestionSection.vue'
 import CategorizationSection from './components/CategorizationSection.vue'
 import TransactionsSection from './components/TransactionsSection.vue'
 import FixedExpensesSection from './components/fixedExpenses/FixedExpensesSection.vue'
 
-type TabKey = 'ingestion' | 'categorization' | 'transactions' | 'fixed-expenses'
+type TabKey = 'dashboard' | 'ingestion' | 'categorization' | 'transactions' | 'fixed-expenses'
 
 const tabs: Array<{
   key: TabKey
   label: string
   description: string
 }> = [
+  {
+    key: 'dashboard',
+    label: 'SPEC5 · Dashboard',
+    description: 'Resumo mensal, gráficos e status de cartões.',
+  },
   {
     key: 'ingestion',
     label: 'SPEC1 · Ingestion',
@@ -37,7 +43,7 @@ const tabs: Array<{
   },
 ]
 
-const activeTab = ref<TabKey>('ingestion')
+const activeTab = ref<TabKey>('dashboard')
 
 const activeTabMeta = computed(
   () => tabs.find((tab) => tab.key === activeTab.value) ?? tabs[0],
@@ -87,7 +93,8 @@ const activeTabMeta = computed(
         </div>
 
         <div class="panelBody">
-          <IngestionSection v-if="activeTab === 'ingestion'" />
+          <DashboardSection v-if="activeTab === 'dashboard'" />
+          <IngestionSection v-else-if="activeTab === 'ingestion'" />
           <CategorizationSection v-else-if="activeTab === 'categorization'" />
           <TransactionsSection v-else-if="activeTab === 'transactions'" />
           <FixedExpensesSection v-else-if="activeTab === 'fixed-expenses'" />

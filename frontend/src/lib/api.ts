@@ -561,6 +561,142 @@ export async function listAccounts(): Promise<AccountListResponse> {
   return requestJson<AccountListResponse>("/accounts");
 }
 
+// ── Dashboard (SPEC5) ────────────────────────────────────────────────────────────
+
+export interface PeriodParams {
+  month?: number;
+  year?: number;
+}
+
+export interface MonthlyCategorySummary {
+  category_id: number | null;
+  category_name: string;
+  total: number;
+  percentage: number;
+  transaction_count: number;
+}
+
+export interface MonthlySummaryResponse {
+  month: number;
+  year: number;
+  total_expenses: number;
+  total_income: number;
+  net: number;
+  categories: MonthlyCategorySummary[];
+}
+
+export interface CategoryBreakdownSlice {
+  category_id: number | null;
+  category_name: string;
+  total: number;
+  percentage: number;
+  color: string;
+}
+
+export interface CategoryBreakdownResponse {
+  month: number;
+  year: number;
+  slices: CategoryBreakdownSlice[];
+  uncategorized_total: number;
+  uncategorized_percentage: number;
+}
+
+export type TimeSeriesGranularity = "daily" | "monthly";
+
+export interface TimeSeriesPoint {
+  date: string;
+  total_expenses: number;
+  total_income: number;
+}
+
+export interface TimeSeriesPeriod {
+  start: string;
+  end: string;
+}
+
+export interface TimeSeriesResponse {
+  granularity: TimeSeriesGranularity;
+  period: TimeSeriesPeriod;
+  data_points: TimeSeriesPoint[];
+  cumulative_expenses: number;
+  cumulative_income: number;
+}
+
+export type CardInvoiceStatus = "open" | "closed" | "paid" | "overdue";
+
+export interface CardInvoice {
+  account_id: string | number;
+  account_name: string;
+  current_invoice_total: number;
+  transaction_count: number;
+  closing_date: string;
+  due_date: string;
+  status: CardInvoiceStatus;
+  days_until_due: number;
+}
+
+export interface UpcomingPayment {
+  account_id: string | number;
+  account_name: string;
+  due_date: string;
+  amount: number;
+  days_until_due: number;
+  is_urgent: boolean;
+}
+
+export interface CardTrackingResponse {
+  month: number;
+  year: number;
+  cards: CardInvoice[];
+  upcoming_payments: UpcomingPayment[];
+  total_card_debt: number;
+}
+
+export const dashboardApi = {
+  getMonthlySummary(params: PeriodParams) {
+    return requestJson<MonthlySummaryResponse>(
+      `/dashboard/monthly-summary${toQueryString({
+        month: params.month ?? undefined,
+        year: params.year ?? undefined,
+      })}`,
+    );
+  },
+
+  getCategoryBreakdown(params: PeriodParams) {
+    return requestJson<CategoryBreakdownResponse>(
+      `/dashboard/charts/category-breakdown${toQueryString({
+        month: params.month ?? undefined,
+        year: params.year ?? undefined,
+      })}`,
+    );
+  },
+
+  getTimeSeries(
+    params: PeriodParams & {
+      granularity?: TimeSeriesGranularity;
+      monthsBack?: number;
+    },
+  ) {
+    return requestJson<TimeSeriesResponse>(
+      `/dashboard/charts/time-series${toQueryString({
+        month: params.month ?? undefined,
+        year: params.year ?? undefined,
+        granularity: params.granularity ?? undefined,
+        months_back: params.monthsBack ?? undefined,
+      })}`,
+    );
+  },
+
+  getCardTracking(params: PeriodParams) {
+    return requestJson<CardTrackingResponse>(
+      `/dashboard/card-tracking${toQueryString({
+        month: params.month ?? undefined,
+        year: params.year ?? undefined,
+      })}`,
+    );
+  },
+};
+
 // ── Fixed Expenses ────────────────────────────────────────────────────────────
 
 export type FixedExpenseFrequency =
