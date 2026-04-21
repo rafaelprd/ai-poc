@@ -888,3 +888,162 @@ export async function updateFixedExpenseEntryStatus(
     },
   );
 }
+
+
+
+// ─── SPEC 6 — Import ────────────────────────────────────────────────────────
+
+export type ImportStatus =
+  | 'pending'
+  | 'processing'
+  | 'completed'
+  | 'completed_with_errors'
+  | 'failed'
+
+export type ImportFileStatus = 'pending' | 'processing' | 'completed' | 'failed'
+
+export interface ImportFileDetail {
+  id: number
+  filename: string
+  status: ImportFileStatus
+  transactionsCount: number
+  newCount: number
+  duplicateCount: number
+  errorMessage: string | null
+}
+
+export interface ImportSummary {
+  id: number
+  accountId: string
+  status: ImportStatus
+  totalFiles: number
+  totalTransactions: number
+  newTransactions: number
+  duplicateTransactions: number
+  failedFiles: number
+  createdAt: string
+  completedAt: string | null
+}
+
+export interface ImportDetail extends ImportSummary {
+  files: ImportFileDetail[]
+}
+
+export interface ImportPagination {
+  page: number
+  pageSize: number
+  totalItems: number
+  totalPages: number
+}
+
+export interface ImportListResponse {
+  items: ImportSummary[]
+  pagination: ImportPagination
+}
+
+export interface ImportCreateResponse {
+  id: number
+  accountId: string
+  status: string
+  totalFiles: number
+  createdAt: string
+  files: Array<{
+    filename: string
+    status: string
+    transactionsCount: number | null
+  }>
+}
+
+function normalizeImportFileDetail(raw: Record<string, unknown>): ImportFileDetail {
+  return {
+    id: raw.id as number,
+    filename: raw.filename as string,
+    status: raw.status as ImportFileStatus,
+    transactionsCount: (raw.transactions_count as number) ?? 0,
+    newCount: (raw.new_count as number) ?? 0,
+    duplicateCount: (raw.duplicate_count as number) ?? 0,
+    errorMessage: (raw.error_message as string | null) ?? null,
+  }
+}
+
+function normalizeImportSummary(raw: Record<string, unknown>): ImportSummary {
+  return {
+    id: raw.id as number,
+    accountId: raw.account_id as string,
+    status: raw.status as ImportStatus,
+    totalFiles: (raw.total_files as number) ?? 0,
+    totalTransactions: (raw.total_transactions as number) ?? 0,
+    newTransactions: (raw.new_transactions as number) ?? 0,
+    duplicateTransactions: (raw.duplicate_transactions as number) ?? 0,
+    failedFiles: (raw.failed_files as number) ?? 0,
+    createdAt: raw.created_at as string,
+    completedAt: (raw.completed_at as string | null) ?? null,
+  }
+}
+
+export async function createImport(
+  files: File[],
+  accountId: string,
+): Promise<ImportCreateResponse> {
+  const formData = new FormData()
+  formData.append('account_id', accountId)
+  files.forEach((f) => formData.append('files', f))
+
+  const raw = await requestJson<Record<string, unknown>>('/imports', {
+    method: 'POST',
+    body: formData,
+  })
+
+  return {
+    id: raw.id as number,
+    accountId: raw.account_id as string,
+    status: raw.status as string,
+    totalFiles: raw.total_files as number,
+    createdAt: raw.created_at as string,
+    files: (raw.files as Array<Record<string, unknown>>).map((f) => ({
+      filename: f.filename as string,
+      status: f.status as string,
+      transactionsCount: f.transactions_count as number | null,
+    })),
+  }
+}
+
+export async function listImports(params: {
+  page?: number
+  pageSize?: number
+  accountId?: string | null
+  status?: ImportStatus | null
+} = {}): Promise<ImportListResponse> {
+  const raw = await requestJson<Record<string, unknown>>(
+    `/imports${toQueryString({
+      page: params.page ?? 1,
+      page_size: params.pageSize ?? 20,
+      account_id: params.accountId ?? undefined,
+      status: params.status ?? undefined,
+    })}`,
+  )
+
+  const rawItems = (raw.items as Array<Record<string, unknown>>) ?? []
+  const rawPag = (raw.pagination as Record<string, unknown>) ?? {}
+
+  return {
+    items: rawItems.map(normalizeImportSummary),
+    pagination: {
+      page: rawPag.page as number,
+      pageSize: rawPag.page_size as number,
+      totalItems: rawPag.total_items as number,
+      totalPages: rawPag.total_pages as number,
+    },
+  }
+}
+
+export async function getImportDetail(importId: number): Promise<ImportDetail> {
+  const raw = await requestJson<Record<string, unknown>>(
+    `/imports/${encodeURIComponent(importId)}`,
+  )
+  const summary = normalizeImportSummary(raw)
+  const files = ((raw.files as Array<Record<string, unknown>>) ?? []).map(
+    normalizeImportFileDetail,
+  )
+  return { ...summary, files }
+}

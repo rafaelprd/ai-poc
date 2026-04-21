@@ -174,3 +174,46 @@ export interface FileUploadState {
   status: BatchStatus | null
   message: string | null
 }
+
+// SPEC 6 — Import
+export type ImportStatus = 'pending' | 'processing' | 'completed' | 'completed_with_errors' | 'failed'
+export type ImportFileStatus = 'pending' | 'processing' | 'completed' | 'failed'
+
+export interface ImportFileDetail {
+  id: number
+  filename: string
+  status: ImportFileStatus
+  transactionsCount: number
+  newCount: number
+  duplicateCount: number
+  errorMessage: string | null
+}
+
+export interface ImportSummary {
+  id: number
+  accountId: string
+  status: ImportStatus
+  totalFiles: number
+  totalTransactions: number
+  newTransactions: number
+  duplicateTransactions: number
+  failedFiles: number
+  createdAt: string
+  completedAt: string | null
+}
+
+export interface ImportDetail extends ImportSummary {
+  files: ImportFileDetail[]
+}
+
+export interface ImportPagination {
+  page: number
+  pageSize: number
+  totalItems: number
+  totalPages: number
+}
+
+export interface ImportListResponse {
+  items: ImportSummary[]
+  pagination: ImportPagination
+}

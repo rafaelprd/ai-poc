@@ -1557,6 +1557,90 @@ class CategorizationRule(Base):
     )
 
 
+class Import(Base):
+    __tablename__ = "imports"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(String(36), nullable=False, index=True)
+    status = Column(String(24), nullable=False, default="pending")
+    total_files = Column(Integer, nullable=False, default=0)
+    total_transactions = Column(Integer, nullable=False, default=0)
+    new_transactions = Column(Integer, nullable=False, default=0)
+    duplicate_transactions = Column(Integer, nullable=False, default=0)
+    failed_files = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ImportFileRecord(Base):
+    __tablename__ = "import_files"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    import_id = Column(
+        Integer,
+        ForeignKey("imports.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    filename = Column(String(255), nullable=False)
+    file_type = Column(String(10), nullable=False)
+    file_size_bytes = Column(Integer, nullable=False)
+    status = Column(String(24), nullable=False, default="pending")
+    transactions_count = Column(Integer, nullable=False, default=0)
+    new_count = Column(Integer, nullable=False, default=0)
+    duplicate_count = Column(Integer, nullable=False, default=0)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ImportTransaction(Base):
+    __tablename__ = "import_transactions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    import_id = Column(
+        Integer,
+        ForeignKey("imports.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    import_file_id = Column(
+        Integer,
+        ForeignKey("import_files.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    transaction_id = Column(
+        Integer,
+        ForeignKey("transaction.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    was_duplicate = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+
+class TransactionHash(Base):
+    __tablename__ = "transaction_hashes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    transaction_id = Column(
+        Integer,
+        ForeignKey("transaction.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    content_hash = Column(String(64), nullable=False)
+    account_id = Column(String(36), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -1583,6 +1667,22 @@ def ensure_account_credit_card_columns() -> None:
 
 
 ensure_account_credit_card_columns()
+
+
+def ensure_import_tables() -> None:
+    """Idempotent: create new import-related tables and the dedup unique index."""
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        try:
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uix_tx_hash_account "
+                "ON transaction_hashes (account_id, content_hash)"
+            )
+        except Exception:
+            pass
+
+
+ensure_import_tables()
 
 with SessionLocal() as _seed_session:
     ensure_system_category(_seed_session)
@@ -3946,3 +4046,518 @@ def get_card_tracking(
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# SPEC6 Import — serializers
+# ---------------------------------------------------------------------------
+
+
+def serialize_import_file_record(f: ImportFileRecord) -> dict:
+    return {
+        "id": f.id,
+        "filename": f.filename,
+        "status": f.status,
+        "transactions_count": f.transactions_count,
+        "new_count": f.new_count,
+        "duplicate_count": f.duplicate_count,
+        "error_message": f.error_message,
+    }
+
+
+def serialize_import_summary(imp: Import) -> dict:
+    return {
+        "id": imp.id,
+        "account_id": imp.account_id,
+        "status": imp.status,
+        "total_files": imp.total_files,
+        "total_transactions": imp.total_transactions,
+        "new_transactions": imp.new_transactions,
+        "duplicate_transactions": imp.duplicate_transactions,
+        "failed_files": imp.failed_files,
+        "created_at": isoformat_z(imp.created_at),
+        "completed_at": isoformat_z(imp.completed_at),
+    }
+
+
+def serialize_import_detail(imp: Import, files: list) -> dict:
+    d = serialize_import_summary(imp)
+    d["files"] = [serialize_import_file_record(f) for f in files]
+    return d
+
+
+# ---------------------------------------------------------------------------
+# SPEC6 Import — business logic helpers
+# ---------------------------------------------------------------------------
+
+
+def resolve_import_status(total_files: int, failed_files: int) -> str:
+    if failed_files == 0:
+        return "completed"
+    elif failed_files == total_files:
+        return "failed"
+    else:
+        return "completed_with_errors"
+
+
+def compute_import_transaction_hash(
+    account_id: str, date_value: date, amount: Decimal, description: str
+) -> str:
+    """Account-scoped dedup hash."""
+    canonical = (
+        f"{account_id}|{date_value.isoformat()}"
+        f"|{amount:.2f}|{normalize_hash_description(description)}"
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# SPEC6 Import — per-file processing
+# ---------------------------------------------------------------------------
+
+
+def _process_import_file(
+    session: Session, imp: Import, file_rec: ImportFileRecord
+) -> None:
+    try:
+        file_rec.status = "processing"
+        file_rec.updated_at = utc_now()
+        session.commit()
+
+        # Parse
+        if file_rec.file_type == "csv":
+            raw_bytes = getattr(file_rec, "_raw_bytes", None)
+            if raw_bytes is None:
+                raise ValueError("CSV_PARSE_ERROR: No file bytes available.")
+            parsed = parse_csv_file(raw_bytes, file_rec.filename)
+        elif file_rec.file_type == "pdf":
+            raw_bytes = getattr(file_rec, "_raw_bytes", None)
+            if raw_bytes is None:
+                raise ValueError("PDF_PARSE_ERROR: No file bytes available.")
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(raw_bytes)
+                tmp_path = Path(tmp.name)
+            try:
+                parsed = parse_pdf_file(tmp_path)
+            finally:
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+        else:
+            raise ValueError(
+                f"INVALID_FILE_TYPE: Unsupported file type '{file_rec.file_type}'."
+            )
+
+        if parsed.fatal:
+            file_rec.status = "failed"
+            file_rec.error_message = (
+                f"{parsed.fatal_code}: {parsed.fatal_message}"
+                if parsed.fatal_code
+                else parsed.fatal_message
+            )
+            file_rec.completed_at = utc_now()
+            file_rec.updated_at = utc_now()
+            session.commit()
+            return
+
+        if not parsed.rows:
+            file_rec.status = "failed"
+            file_rec.error_message = "No transactions extracted."
+            file_rec.completed_at = utc_now()
+            file_rec.updated_at = utc_now()
+            session.commit()
+            return
+
+        # Dedup: batch pre-check
+        row_hashes = [
+            compute_import_transaction_hash(
+                imp.account_id, row.date_value, row.amount, row.description
+            )
+            for row in parsed.rows
+        ]
+
+        existing_hashes_rows = session.execute(
+            select(TransactionHash.content_hash).where(
+                TransactionHash.account_id == imp.account_id,
+                TransactionHash.content_hash.in_(row_hashes),
+            )
+        ).all()
+        existing_hashes = {r[0] for r in existing_hashes_rows}
+
+        new_count = 0
+        dup_count = 0
+
+        for row, content_hash in zip(parsed.rows, row_hashes):
+            if content_hash in existing_hashes:
+                dup_count += 1
+                # Record the link as duplicate if originating transaction exists
+                existing_tx = session.execute(
+                    select(Transaction)
+                    .join(
+                        TransactionHash,
+                        Transaction.id == TransactionHash.transaction_id,
+                    )
+                    .where(
+                        TransactionHash.content_hash == content_hash,
+                        TransactionHash.account_id == imp.account_id,
+                    )
+                ).scalar_one_or_none()
+                if existing_tx:
+                    link = ImportTransaction(
+                        import_id=imp.id,
+                        import_file_id=file_rec.id,
+                        transaction_id=existing_tx.id,
+                        was_duplicate=True,
+                        created_at=utc_now(),
+                    )
+                    try:
+                        with session.begin_nested():
+                            session.add(link)
+                            session.flush()
+                    except IntegrityError:
+                        pass
+                continue
+
+            # Insert new transaction
+            tx = Transaction(
+                import_file_id=str(file_rec.id),
+                account_id=imp.account_id,
+                date=row.date_value,
+                description=row.description,
+                amount=row.amount,
+                type=row.transaction_type,
+                category_id=None,
+                hash=row.hash_value,
+                raw_data=row.raw_data,
+                created_at=utc_now(),
+                updated_at=utc_now(),
+            )
+            inserted = False
+            try:
+                with session.begin_nested():
+                    session.add(tx)
+                    session.flush()
+                inserted = True
+            except IntegrityError:
+                dup_count += 1
+                existing_hashes.add(content_hash)
+                continue
+
+            if inserted:
+                # Insert hash record
+                tx_hash = TransactionHash(
+                    transaction_id=tx.id,
+                    content_hash=content_hash,
+                    account_id=imp.account_id,
+                    created_at=utc_now(),
+                )
+                try:
+                    with session.begin_nested():
+                        session.add(tx_hash)
+                        session.flush()
+                except IntegrityError:
+                    pass
+
+                # Insert link
+                link = ImportTransaction(
+                    import_id=imp.id,
+                    import_file_id=file_rec.id,
+                    transaction_id=tx.id,
+                    was_duplicate=False,
+                    created_at=utc_now(),
+                )
+                try:
+                    with session.begin_nested():
+                        session.add(link)
+                        session.flush()
+                except IntegrityError:
+                    pass
+
+                new_count += 1
+                existing_hashes.add(content_hash)
+
+        file_rec.transactions_count = len(parsed.rows)
+        file_rec.new_count = new_count
+        file_rec.duplicate_count = dup_count
+        file_rec.status = "completed"
+        file_rec.error_message = None
+        file_rec.completed_at = utc_now()
+        file_rec.updated_at = utc_now()
+        session.commit()
+
+    except Exception as exc:
+        session.rollback()
+        file_rec = session.get(ImportFileRecord, file_rec.id)
+        if file_rec:
+            file_rec.status = "failed"
+            file_rec.error_message = str(exc)[:500]
+            file_rec.completed_at = utc_now()
+            file_rec.updated_at = utc_now()
+            session.commit()
+
+
+# ---------------------------------------------------------------------------
+# SPEC6 Import — background task
+# ---------------------------------------------------------------------------
+
+
+def _run_import_background(import_id: int, file_data: list[tuple[int, bytes]]) -> None:
+    """Background task: attach raw bytes to file records then process."""
+    session = SessionLocal()
+    try:
+        imp = session.get(Import, import_id)
+        if imp is None:
+            return
+        imp.status = "processing"
+        imp.updated_at = utc_now()
+        session.commit()
+
+        for file_id, raw_bytes in file_data:
+            file_rec = session.get(ImportFileRecord, file_id)
+            if file_rec is None:
+                continue
+            file_rec._raw_bytes = raw_bytes
+            _process_import_file(session, imp, file_rec)
+
+        # Aggregate
+        all_files = (
+            session.execute(
+                select(ImportFileRecord).where(ImportFileRecord.import_id == import_id)
+            )
+            .scalars()
+            .all()
+        )
+
+        total_tx = sum(f.transactions_count for f in all_files)
+        new_tx = sum(f.new_count for f in all_files)
+        dup_tx = sum(f.duplicate_count for f in all_files)
+        failed = sum(1 for f in all_files if f.status == "failed")
+
+        imp.total_transactions = total_tx
+        imp.new_transactions = new_tx
+        imp.duplicate_transactions = dup_tx
+        imp.failed_files = failed
+        imp.status = resolve_import_status(imp.total_files, failed)
+        imp.completed_at = utc_now()
+        imp.updated_at = utc_now()
+        session.commit()
+    except Exception:
+        session.rollback()
+        try:
+            imp = session.get(Import, import_id)
+            if imp:
+                imp.status = "failed"
+                imp.completed_at = utc_now()
+                imp.updated_at = utc_now()
+                session.commit()
+        except Exception:
+            pass
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# SPEC6 Import — API endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/v1/imports", status_code=201)
+async def create_import(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+    account_id: str = Form(...),
+):
+    if not files:
+        raise_api_error(400, "NO_FILES", "No files attached to the request.")
+    if len(files) > MAX_FILES_PER_REQUEST:
+        raise_api_error(
+            400,
+            "BATCH_SIZE_EXCEEDED",
+            f"Maximum {MAX_FILES_PER_REQUEST} files per batch.",
+        )
+
+    account_id_clean = normalize_spaces(str(account_id)) if account_id else None
+    if not account_id_clean:
+        raise_api_error(422, "VALIDATION_ERROR", "account_id is required.")
+
+    prepared: list[dict] = []
+    for upload in files:
+        raw_bytes = await upload.read()
+        if len(raw_bytes) > MAX_FILE_SIZE_BYTES:
+            raise_api_error(
+                400,
+                "FILE_TOO_LARGE",
+                f"File '{upload.filename}' exceeds 10 MB limit.",
+            )
+        try:
+            file_type = detect_file_type(raw_bytes)
+        except Exception:
+            raise_api_error(
+                400,
+                "INVALID_FILE_TYPE",
+                f"File '{upload.filename}' has unsupported type. Accepted: csv, pdf.",
+            )
+        prepared.append(
+            {
+                "filename": upload.filename or "unknown",
+                "file_type": file_type,
+                "file_size_bytes": len(raw_bytes),
+                "raw_bytes": raw_bytes,
+            }
+        )
+
+    session = SessionLocal()
+    try:
+        account = session.get(Account, account_id_clean)
+        if account is None:
+            raise_api_error(
+                404, "ACCOUNT_NOT_FOUND", f"Account '{account_id_clean}' not found."
+            )
+
+        imp = Import(
+            account_id=account_id_clean,
+            status="pending",
+            total_files=len(prepared),
+            total_transactions=0,
+            new_transactions=0,
+            duplicate_transactions=0,
+            failed_files=0,
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        session.add(imp)
+        session.flush()
+
+        file_records: list[ImportFileRecord] = []
+        for item in prepared:
+            fr = ImportFileRecord(
+                import_id=imp.id,
+                filename=item["filename"],
+                file_type=item["file_type"],
+                file_size_bytes=item["file_size_bytes"],
+                status="pending",
+                transactions_count=0,
+                new_count=0,
+                duplicate_count=0,
+                error_message=None,
+                created_at=utc_now(),
+                updated_at=utc_now(),
+            )
+            session.add(fr)
+            session.flush()
+            fr._raw_bytes = item["raw_bytes"]
+            file_records.append(fr)
+
+        session.commit()
+
+        response_files = [
+            {
+                "filename": fr.filename,
+                "status": fr.status,
+                "transactions_count": None,
+            }
+            for fr in file_records
+        ]
+
+        import_id = imp.id
+        created_at_iso = isoformat_z(imp.created_at)
+
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception as exc:
+        session.rollback()
+        raise_api_error(500, "UPLOAD_FAILED", str(exc))
+    finally:
+        session.close()
+
+    # Schedule background processing — pass raw bytes via closure
+    file_data = [(fr.id, item["raw_bytes"]) for fr, item in zip(file_records, prepared)]
+    background_tasks.add_task(_run_import_background, import_id, file_data)
+
+    return {
+        "id": import_id,
+        "account_id": account_id_clean,
+        "status": "processing",
+        "total_files": len(prepared),
+        "created_at": created_at_iso,
+        "files": response_files,
+    }
+
+
+@app.get("/api/v1/imports")
+def list_imports(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    account_id: str | None = Query(None),
+    status: str | None = Query(None),
+):
+    VALID_IMPORT_STATUSES = {
+        "pending",
+        "processing",
+        "completed",
+        "completed_with_errors",
+        "failed",
+    }
+    if status is not None and status not in VALID_IMPORT_STATUSES:
+        raise_api_error(400, "INVALID_STATUS", f"Invalid status '{status}'.")
+
+    session = SessionLocal()
+    try:
+        query = select(Import)
+        if account_id is not None:
+            query = query.where(Import.account_id == account_id)
+        if status is not None:
+            query = query.where(Import.status == status)
+
+        total = session.execute(
+            select(func.count()).select_from(query.subquery())
+        ).scalar_one()
+
+        offset = (page - 1) * page_size
+        imports = (
+            session.execute(
+                query.order_by(desc(Import.created_at)).offset(offset).limit(page_size)
+            )
+            .scalars()
+            .all()
+        )
+
+        items = [serialize_import_summary(imp) for imp in imports]
+        total_pages = max(1, (int(total) + page_size - 1) // page_size)
+
+        return {
+            "items": items,
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "total_items": int(total),
+                "total_pages": total_pages,
+            },
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/v1/imports/{import_id}")
+def get_import_detail(import_id: int):
+    session = SessionLocal()
+    try:
+        imp = session.get(Import, import_id)
+        if imp is None:
+            raise_api_error(404, "IMPORT_NOT_FOUND", f"Import {import_id} not found.")
+        files = (
+            session.execute(
+                select(ImportFileRecord)
+                .where(ImportFileRecord.import_id == import_id)
+                .order_by(ImportFileRecord.id.asc())
+            )
+            .scalars()
+            .all()
+        )
+        return serialize_import_detail(imp, files)
+    finally:
+        session.close()
