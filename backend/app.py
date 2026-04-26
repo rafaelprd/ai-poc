@@ -1568,6 +1568,7 @@ class Import(Base):
     new_transactions = Column(Integer, nullable=False, default=0)
     duplicate_transactions = Column(Integer, nullable=False, default=0)
     failed_files = Column(Integer, nullable=False, default=0)
+    installment_skipped = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at = Column(
         DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
@@ -1592,6 +1593,7 @@ class ImportFileRecord(Base):
     transactions_count = Column(Integer, nullable=False, default=0)
     new_count = Column(Integer, nullable=False, default=0)
     duplicate_count = Column(Integer, nullable=False, default=0)
+    installment_skipped = Column(Integer, nullable=False, default=0)
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at = Column(
@@ -1641,6 +1643,58 @@ class TransactionHash(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
 
 
+class InstallmentPlan(Base):
+    """Groups all installments of the same credit-card purchase."""
+
+    __tablename__ = "installment_plans"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(String(36), nullable=False, index=True)
+    # Description with the N/M suffix stripped and lowercased
+    base_description = Column(String(500), nullable=False)
+    # Amount of each installment (the value that appears on the statement)
+    installment_amount = Column(Numeric(14, 2), nullable=False)
+    total_installments = Column(Integer, nullable=False)
+    # Date of the first installment as it appeared on the statement
+    first_date = Column(Date, nullable=False)
+    # SHA-256 of (account_id, base_description, installment_amount, total_installments, first_date)
+    anchor_hash = Column(String(64), nullable=False, unique=True, index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
+class InstallmentEntry(Base):
+    """One row per installment in a plan."""
+
+    __tablename__ = "installment_entries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plan_id = Column(
+        Integer,
+        ForeignKey("installment_plans.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    installment_number = Column(Integer, nullable=False)  # 1-based
+    expected_date = Column(
+        Date, nullable=False
+    )  # approximate month of this installment
+    transaction_id = Column(
+        Integer,
+        ForeignKey("transaction.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    status = Column(String(20), nullable=False, default="pending")
+    # status values: pending | matched | skipped_duplicate
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -1680,6 +1734,29 @@ def ensure_import_tables() -> None:
             )
         except Exception:
             pass
+
+    # Ensure installment_skipped column exists on import_files (added in this patch)
+    try:
+        insp2 = inspect(engine)
+        if_cols = {c["name"] for c in insp2.get_columns("import_files")}
+        if "installment_skipped" not in if_cols:
+            with engine.begin() as conn2:
+                conn2.exec_driver_sql(
+                    "ALTER TABLE import_files ADD COLUMN installment_skipped INTEGER NOT NULL DEFAULT 0"
+                )
+    except Exception:
+        pass
+
+    try:
+        insp3 = inspect(engine)
+        imp_cols = {c["name"] for c in insp3.get_columns("imports")}
+        if "installment_skipped" not in imp_cols:
+            with engine.begin() as conn3:
+                conn3.exec_driver_sql(
+                    "ALTER TABLE imports ADD COLUMN installment_skipped INTEGER NOT NULL DEFAULT 0"
+                )
+    except Exception:
+        pass
 
 
 ensure_import_tables()
@@ -4061,6 +4138,7 @@ def serialize_import_file_record(f: ImportFileRecord) -> dict:
         "transactions_count": f.transactions_count,
         "new_count": f.new_count,
         "duplicate_count": f.duplicate_count,
+        "installment_skipped": getattr(f, "installment_skipped", 0) or 0,
         "error_message": f.error_message,
     }
 
@@ -4074,6 +4152,7 @@ def serialize_import_summary(imp: Import) -> dict:
         "total_transactions": imp.total_transactions,
         "new_transactions": imp.new_transactions,
         "duplicate_transactions": imp.duplicate_transactions,
+        "installment_skipped": getattr(imp, "installment_skipped", 0) or 0,
         "failed_files": imp.failed_files,
         "created_at": isoformat_z(imp.created_at),
         "completed_at": isoformat_z(imp.completed_at),
@@ -4112,6 +4191,208 @@ def compute_import_transaction_hash(
 
 
 # ---------------------------------------------------------------------------
+# SPEC6 Import — installment helpers
+# ---------------------------------------------------------------------------
+
+# Regex: matches " 1/12" or " 01/12" at the end of a description (with optional trailing spaces)
+_INSTALLMENT_RE = re.compile(r"\s+(\d{1,3})/(\d{1,3})\s*$")
+
+
+def detect_installment(description: str) -> tuple[str, int, int] | None:
+    """
+    If description ends with ' N/M', return (base_description, current, total).
+    base_description has the N/M suffix stripped and is normalized.
+    Returns None if no installment pattern found.
+    """
+    m = _INSTALLMENT_RE.search(description)
+    if m is None:
+        return None
+    current = int(m.group(1))
+    total = int(m.group(2))
+    if total < 2 or current < 1 or current > total:
+        return None
+    base = description[: m.start()].strip()
+    if not base:
+        return None
+    return base, current, total
+
+
+def compute_plan_anchor_hash(
+    account_id: str,
+    base_description: str,
+    installment_amount: Decimal,
+    total_installments: int,
+    first_date: date,
+) -> str:
+    """Stable identity key for an installment plan."""
+    normalized_desc = normalize_hash_description(base_description)
+    canonical = (
+        f"{account_id}|{normalized_desc}"
+        f"|{installment_amount:.2f}|{total_installments}|{first_date.isoformat()}"
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def add_months_to_date(d: date, months: int) -> date:
+    """Add N months to a date, clamping day to the last day of the target month."""
+    month = d.month - 1 + months
+    year = d.year + month // 12
+    month = month % 12 + 1
+    day = min(d.day, monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def get_or_create_installment_plan(
+    session: Session,
+    account_id: str,
+    base_description: str,
+    installment_amount: Decimal,
+    total_installments: int,
+    first_date: date,
+) -> "InstallmentPlan":
+    """
+    Find an existing plan or create a new one with all its entries.
+    Idempotent: safe to call multiple times for the same plan.
+    """
+    anchor = compute_plan_anchor_hash(
+        account_id, base_description, installment_amount, total_installments, first_date
+    )
+    plan = session.execute(
+        select(InstallmentPlan).where(InstallmentPlan.anchor_hash == anchor)
+    ).scalar_one_or_none()
+
+    if plan is not None:
+        return plan
+
+    plan = InstallmentPlan(
+        account_id=account_id,
+        base_description=normalize_hash_description(base_description),
+        installment_amount=installment_amount,
+        total_installments=total_installments,
+        first_date=first_date,
+        anchor_hash=anchor,
+        created_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    try:
+        with session.begin_nested():
+            session.add(plan)
+            session.flush()
+    except IntegrityError:
+        session.rollback()
+        plan = session.execute(
+            select(InstallmentPlan).where(InstallmentPlan.anchor_hash == anchor)
+        ).scalar_one()
+        return plan
+
+    # Create one entry per installment
+    for n in range(1, total_installments + 1):
+        expected = add_months_to_date(first_date, n - 1)
+        entry = InstallmentEntry(
+            plan_id=plan.id,
+            installment_number=n,
+            expected_date=expected,
+            transaction_id=None,
+            status="pending",
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        try:
+            with session.begin_nested():
+                session.add(entry)
+                session.flush()
+        except IntegrityError:
+            pass  # entry already exists
+
+    return plan
+
+
+def find_installment_entry(
+    session: Session, plan_id: int, installment_number: int
+) -> "InstallmentEntry | None":
+    return session.execute(
+        select(InstallmentEntry).where(
+            InstallmentEntry.plan_id == plan_id,
+            InstallmentEntry.installment_number == installment_number,
+        )
+    ).scalar_one_or_none()
+
+
+def find_plan_for_installment(
+    session: Session,
+    account_id: str,
+    base_description: str,
+    installment_amount: Decimal,
+    total_installments: int,
+    current_num: int,
+    row_date: date,
+) -> "tuple[InstallmentPlan | None, InstallmentEntry | None]":
+    """
+    Find the installment plan and entry that best match a given installment row.
+
+    Queries by (account_id, base_description, installment_amount, total_installments),
+    which may return MULTIPLE plans when the same item was purchased more than once
+    (e.g. two separate AMAZON 1/12 purchases at R$100 in different months).
+
+    For each candidate plan the entry at `current_num` is checked:
+    - Its `expected_date` must be within 45 days of `row_date` (tolerates billing
+      cycle day-of-month drift between months).
+    - Among all qualifying candidates the one with the smallest date delta wins.
+
+    Returns (plan, entry) where entry.status is whatever it currently is
+    (caller decides whether to skip or insert based on status), or (None, None)
+    if no suitable plan/entry is found.
+    """
+    normalized_desc = normalize_hash_description(base_description)
+    candidates = (
+        session.execute(
+            select(InstallmentPlan).where(
+                InstallmentPlan.account_id == account_id,
+                InstallmentPlan.base_description == normalized_desc,
+                InstallmentPlan.installment_amount == installment_amount,
+                InstallmentPlan.total_installments == total_installments,
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    if not candidates:
+        return None, None
+
+    best_plan: "InstallmentPlan | None" = None
+    best_entry: "InstallmentEntry | None" = None
+    best_delta: int | None = None
+
+    for plan in candidates:
+        entry = find_installment_entry(session, plan.id, current_num)
+        if entry is None:
+            continue
+        delta = abs((entry.expected_date - row_date).days)
+        # 45-day window covers the widest possible billing-cycle drift
+        if delta > 45:
+            continue
+        # Prefer plans whose entry is still pending (not yet matched) so we
+        # don't accidentally skip an installment that belongs to a different
+        # purchase of the same item.
+        if best_delta is None or delta < best_delta:
+            best_plan = plan
+            best_entry = entry
+            best_delta = delta
+        elif (
+            delta == best_delta
+            and best_entry is not None
+            and best_entry.status == "matched"
+            and entry.status == "pending"
+        ):
+            # Same distance but the new candidate is still pending — prefer it
+            best_plan = plan
+            best_entry = entry
+
+    return best_plan, best_entry
+
+
+# ---------------------------------------------------------------------------
 # SPEC6 Import — per-file processing
 # ---------------------------------------------------------------------------
 
@@ -4124,7 +4405,7 @@ def _process_import_file(
         file_rec.updated_at = utc_now()
         session.commit()
 
-        # Parse
+        # ── Parse ──────────────────────────────────────────────────────────
         if file_rec.file_type == "csv":
             raw_bytes = getattr(file_rec, "_raw_bytes", None)
             if raw_bytes is None:
@@ -4171,7 +4452,7 @@ def _process_import_file(
             session.commit()
             return
 
-        # Dedup: batch pre-check
+        # ── Dedup pre-check (batch) ─────────────────────────────────────────
         row_hashes = [
             compute_import_transaction_hash(
                 imp.account_id, row.date_value, row.amount, row.description
@@ -4185,15 +4466,19 @@ def _process_import_file(
                 TransactionHash.content_hash.in_(row_hashes),
             )
         ).all()
-        existing_hashes = {r[0] for r in existing_hashes_rows}
+        existing_hashes: set[str] = {r[0] for r in existing_hashes_rows}
 
         new_count = 0
         dup_count = 0
+        installment_skipped_count = 0
 
         for row, content_hash in zip(parsed.rows, row_hashes):
+            # ── Installment detection ───────────────────────────────────────
+            installment_info = detect_installment(row.description)
+
+            # ── Already in DB (hash-based dedup) ───────────────────────────
             if content_hash in existing_hashes:
                 dup_count += 1
-                # Record the link as duplicate if originating transaction exists
                 existing_tx = session.execute(
                     select(Transaction)
                     .join(
@@ -4221,7 +4506,35 @@ def _process_import_file(
                         pass
                 continue
 
-            # Insert new transaction
+            # ── Installment N>1: check if already pre-created ───────────────
+            if installment_info is not None:
+                base_desc, current_num, total_num = installment_info
+
+                if current_num > 1:
+                    # Query by (account_id, description, amount, total) — no
+                    # first_date inference — so multiple plans for the same item
+                    # purchased at different times are all considered.  The helper
+                    # picks the candidate whose expected_date is closest to the
+                    # current row's date (within a 45-day window).
+                    existing_plan, existing_entry = find_plan_for_installment(
+                        session,
+                        imp.account_id,
+                        base_desc,
+                        row.amount,
+                        total_num,
+                        current_num,
+                        row.date_value,
+                    )
+
+                    if existing_plan is not None and existing_entry is not None:
+                        if existing_entry.status == "matched":
+                            # Already inserted from a previous import — skip
+                            installment_skipped_count += 1
+                            continue
+                        # Entry is pending — fall through to insert below and
+                        # mark it matched after insertion
+
+            # ── Insert new transaction ──────────────────────────────────────
             tx = Transaction(
                 import_file_id=str(file_rec.id),
                 account_id=imp.account_id,
@@ -4261,7 +4574,7 @@ def _process_import_file(
                 except IntegrityError:
                     pass
 
-                # Insert link
+                # Insert import link
                 link = ImportTransaction(
                     import_id=imp.id,
                     import_file_id=file_rec.id,
@@ -4279,9 +4592,80 @@ def _process_import_file(
                 new_count += 1
                 existing_hashes.add(content_hash)
 
+                # ── Installment plan bookkeeping ────────────────────────────
+                if installment_info is not None:
+                    base_desc, current_num, total_num = installment_info
+
+                    if current_num == 1:
+                        # Installment 1: create (or get) the plan and all its
+                        # future entries, keyed by the actual first_date from
+                        # this row (anchor hash includes it, so a second purchase
+                        # of the same item in the same month would merge — which
+                        # is the only genuinely ambiguous case).
+                        plan = get_or_create_installment_plan(
+                            session,
+                            imp.account_id,
+                            base_desc,
+                            row.amount,
+                            total_num,
+                            row.date_value,
+                        )
+                        entry_to_mark = (
+                            find_installment_entry(session, plan.id, 1)
+                            if plan
+                            else None
+                        )
+                    else:
+                        # Installment N>1: find the plan by matching on
+                        # (account_id, description, amount, total) + date proximity.
+                        # Do NOT infer first_date from the current row's date —
+                        # that inference breaks when billing-cycle day drifts or
+                        # when multiple plans share the same description+amount.
+                        plan, entry_to_mark = find_plan_for_installment(
+                            session,
+                            imp.account_id,
+                            base_desc,
+                            row.amount,
+                            total_num,
+                            current_num,
+                            row.date_value,
+                        )
+                        if plan is None:
+                            # No plan found: the first installment hasn't been
+                            # uploaded yet.  Create the plan now with an inferred
+                            # first_date so future installments can still find it.
+                            inferred_first = add_months_to_date(
+                                row.date_value, -(current_num - 1)
+                            )
+                            plan = get_or_create_installment_plan(
+                                session,
+                                imp.account_id,
+                                base_desc,
+                                row.amount,
+                                total_num,
+                                inferred_first,
+                            )
+                            entry_to_mark = (
+                                find_installment_entry(session, plan.id, current_num)
+                                if plan
+                                else None
+                            )
+
+                    # Mark this installment's entry as matched
+                    if plan is not None and entry_to_mark is not None:
+                        entry_to_mark.transaction_id = tx.id
+                        entry_to_mark.status = "matched"
+                        entry_to_mark.updated_at = utc_now()
+                        try:
+                            with session.begin_nested():
+                                session.flush()
+                        except Exception:
+                            pass
+
         file_rec.transactions_count = len(parsed.rows)
         file_rec.new_count = new_count
         file_rec.duplicate_count = dup_count
+        file_rec.installment_skipped = installment_skipped_count
         file_rec.status = "completed"
         file_rec.error_message = None
         file_rec.completed_at = utc_now()
@@ -4335,11 +4719,13 @@ def _run_import_background(import_id: int, file_data: list[tuple[int, bytes]]) -
         new_tx = sum(f.new_count for f in all_files)
         dup_tx = sum(f.duplicate_count for f in all_files)
         failed = sum(1 for f in all_files if f.status == "failed")
+        inst_skipped = sum(getattr(f, "installment_skipped", 0) or 0 for f in all_files)
 
         imp.total_transactions = total_tx
         imp.new_transactions = new_tx
         imp.duplicate_transactions = dup_tx
         imp.failed_files = failed
+        imp.installment_skipped = inst_skipped
         imp.status = resolve_import_status(imp.total_files, failed)
         imp.completed_at = utc_now()
         imp.updated_at = utc_now()
@@ -4559,5 +4945,75 @@ def get_import_detail(import_id: int):
             .all()
         )
         return serialize_import_detail(imp, files)
+    finally:
+        session.close()
+
+
+@app.get("/api/v1/installment-plans")
+def list_installment_plans(
+    account_id: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
+    session = SessionLocal()
+    try:
+        query = select(InstallmentPlan)
+        if account_id:
+            query = query.where(InstallmentPlan.account_id == account_id)
+
+        total = session.execute(
+            select(func.count()).select_from(query.subquery())
+        ).scalar_one()
+
+        offset = (page - 1) * page_size
+        plans = (
+            session.execute(
+                query.order_by(desc(InstallmentPlan.created_at))
+                .offset(offset)
+                .limit(page_size)
+            )
+            .scalars()
+            .all()
+        )
+
+        def serialize_plan(p: InstallmentPlan) -> dict:
+            entries = (
+                session.execute(
+                    select(InstallmentEntry)
+                    .where(InstallmentEntry.plan_id == p.id)
+                    .order_by(InstallmentEntry.installment_number.asc())
+                )
+                .scalars()
+                .all()
+            )
+            return {
+                "id": p.id,
+                "account_id": p.account_id,
+                "base_description": p.base_description,
+                "installment_amount": float(p.installment_amount),
+                "total_installments": p.total_installments,
+                "first_date": p.first_date.isoformat(),
+                "created_at": isoformat_z(p.created_at),
+                "entries": [
+                    {
+                        "installment_number": e.installment_number,
+                        "expected_date": e.expected_date.isoformat(),
+                        "status": e.status,
+                        "transaction_id": e.transaction_id,
+                    }
+                    for e in entries
+                ],
+            }
+
+        total_pages = max(1, (int(total) + page_size - 1) // page_size)
+        return {
+            "items": [serialize_plan(p) for p in plans],
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "total_items": int(total),
+                "total_pages": total_pages,
+            },
+        }
     finally:
         session.close()
